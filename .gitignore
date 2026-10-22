@@ -1,0 +1,8 @@
+# 构建产物
+*.app/
+*.zip
+build/
+
+# macOS
+.DS_Store
+._*
