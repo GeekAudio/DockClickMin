@@ -567,31 +567,37 @@ final class ClickMonitor {
         TileCache.shared.refresh()
     }
 
-    /// 隐藏整个应用，三级回退（`hide()` 对 helper / 无 Hide 菜单的 app 会直接返回 false）：
+    /// 隐藏整个应用，四级回退（`hide()` 对 helper / Electron / Tauri 类 app 常直接返回 false）：
     ///   ① NSRunningApplication.hide()
-    ///   ② AX 置 AXHidden = true
-    ///   ③ 发 ⌘H
+    ///   ② 全局 ⌘H —— 走正常键盘事件流，前台 app 必收（Tauri 类不认 postToPid）
+    ///   ③ ⌘H → postToPid
+    ///   ④ AXHidden（放最后：部分 app 被置位后会自己弹回来，表现为「闪一下」）
+    ///   ⑤ 全失败则降级为最小化，至少把窗口收走
     private func hideApp(pid: pid_t) -> String {
         guard let app = NSRunningApplication(processIdentifier: pid) else { return "无进程" }
-        var report: [String] = []
+        if app.hide() { return "hide() 成功" }
 
-        if app.hide() {
-            return "hide() 成功"
-        }
-        report.append("hide()=false")
-
+        var report = ["hide()=false"]
         let el = AXUIElementCreateApplication(pid)
+
+        postGlobalKey(code: 0x04, flags: .maskCommand)
+        usleep(120_000)
+        if isHidden(el, app) { return report.joined(separator: " / ") + " / 全局⌘H 成功" }
+        report.append("全局⌘H 无效")
+
+        sendKey(pid: pid, code: 0x04, flags: .maskCommand)
+        usleep(110_000)
+        if isHidden(el, app) { return report.joined(separator: " / ") + " / ⌘H→pid 成功" }
+        report.append("⌘H→pid 无效")
+
         if AXUIElementSetAttributeValue(el, kAXHiddenAttribute as CFString, kCFBooleanTrue) == .success {
-            usleep(80_000)
+            usleep(90_000)
             if isHidden(el, app) { return report.joined(separator: " / ") + " / AXHidden 成功" }
         }
         report.append("AXHidden 无效")
 
-        sendKey(pid: pid, code: 0x04, flags: .maskCommand)   // ⌘H
-        usleep(150_000)
-        if isHidden(el, app) { return report.joined(separator: " / ") + " / ⌘H 成功" }
-
-        report.append("⌘H 无效")
+        let m = minimizeAll(pid: pid)
+        report.append("降级最小化：\(m)")
         return report.joined(separator: " / ")
     }
 
@@ -634,11 +640,15 @@ final class ClickMonitor {
         dlog("关闭启动台：全部无效 overlayOpen=true（\(ms())ms）")
     }
 
-    /// 全局按键（会同时送到前台 app，仅作兜底）
-    private func postGlobalKey(code: CGKeyCode) {
+    /// 全局按键（走正常事件流，前台 app 收到；仅用于「前台 app 自己」的菜单命令）
+    private func postGlobalKey(code: CGKeyCode, flags: CGEventFlags = []) {
         guard let src = CGEventSource(stateID: .hidSystemState),
               let d = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: true),
               let u = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: false) else { return }
+        if !flags.isEmpty {
+            d.flags = flags
+            u.flags = flags
+        }
         d.post(tap: .cghidEventTap)
         u.post(tap: .cghidEventTap)
     }

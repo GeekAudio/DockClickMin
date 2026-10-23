@@ -82,9 +82,17 @@ cd DockClickMin
 | 方式 | 实现 | 动画 |
 |---|---|---|
 | **最小化窗口**（默认） | 三级回退，每级都验证结果 | ✅ 前两级有 |
-| 隐藏整个应用 | 三级回退：`hide()` → `AXHidden` → ⌘H | ❌ 瞬时 |
+| 隐藏整个应用 | 四级回退，全失败降级为最小化 | ❌ 瞬时 |
 
-**为什么隐藏也要三级**：`NSRunningApplication.hide()` 对 helper 类、没有「隐藏」菜单项的 app 会直接返回 `false`（实测 TCC Helper 就是 `hide ok=false`）。所以隐藏同样要验证，再依次退到 AX 的 `AXHidden`、最后发 ⌘H。
+**为什么隐藏也要回退**：实测 `NSRunningApplication.hide()` 对 TCC Helper（helper）、WorkBuddy（Electron）、Clash Verge（Tauri）**都返回 `false`**。于是按 app 类型踩出两条经验：
+
+| 现象 | 原因 | 对策 |
+|---|---|---|
+| 设置 `AXHidden` 后「闪一下」 | Electron 类被置位后会自己弹回来 | AXHidden 挪到最后 |
+| `postToPid` 发 ⌘H 无效 | Tauri 类不认直接投递的键事件 | 先发**全局** ⌘H（走正常键盘事件流） |
+
+最终顺序：`hide()` → 全局 ⌘H → ⌘H→pid → `AXHidden` → 降级最小化。日志逐级记录，例如
+`收起 Clash Verge：hide()=false / 全局⌘H 成功`。
 
 三级回退（`minimizeAll`）：
 
