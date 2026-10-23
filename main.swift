@@ -525,22 +525,110 @@ enum UnpinQQ {
         for k in kids { walk(k, depth: depth + 1, into: &out) }
     }
 
-    /// 执行一次「取消置顶」，返回可读结果
+    /// 执行一次「取消置顶」，返回可读结果。
+    /// 菜单里没有「置顶」项（实测 100 个菜单项全无），所以主路径是**窗口 AX 树深度搜索**，
+    /// 按完用窗口层级自校验：方向反了就再按一次恢复，不会把没置顶的给打开。
     static func unpin() -> String {
         guard let pid = qqPID() else { return "QQ 没在运行" }
-        let items = allMenuItems(pid: pid)
-        let hits = items.filter { $0.title.contains("置顶") }
-        guard let target = hits.first else {
-            return "QQ 菜单里没有「置顶」项（共 \(items.count) 个菜单项）"
+        let before = qqWindowLayers(pid)
+        guard let top = before.max() else { return "QQ 没有可见窗口" }
+        if top == 0 { return "QQ 窗口层级本来就是 0（未置顶）" }
+
+        // ① 先找窗口里的按钮（标题栏的图钉/置顶）
+        if let btn = findPinButton(pid: pid) {
+            AXUIElementPerformAction(btn, kAXPressAction as CFString)
+            usleep(260_000)
+            let now = qqWindowLayers(pid).max() ?? 0
+            if now < top { return "已取消置顶（层级 \(top) → \(now)）" }
+            if now > top {
+                AXUIElementPerformAction(btn, kAXPressAction as CFString)   // 按反了，恢复
+                usleep(150_000)
+                return "按错了方向（置顶反而被打开），已按第二次恢复原状"
+            }
+            return "按了按钮但层级没变（\(top) → \(now)）"
         }
-        if !target.checked { return "QQ 当前未置顶（「\(target.title)」未勾选）" }
-        let err = AXUIElementPerformAction(target.element, kAXPressAction as CFString)
-        if err != .success { return "按「\(target.title)」失败（AXError \(err.rawValue)）" }
-        usleep(150_000)
-        // 复查：菜单项是否变成未勾选
-        let after = allMenuItems(pid: pid).first { $0.title.contains("置顶") }
-        let nowChecked = after?.checked ?? false
-        return nowChecked ? "已按「\(target.title)」，但复查仍是勾选状态" : "已取消置顶（\(target.title)）"
+
+        // ② 退而求其次：菜单树
+        let items = allMenuItems(pid: pid)
+        if let it = items.first(where: { $0.title.contains("置顶") }) {
+            if it.checked {
+                AXUIElementPerformAction(it.element, kAXPressAction as CFString)
+                usleep(200_000)
+                let now = qqWindowLayers(pid).max() ?? 0
+                return now < top ? "已取消置顶（菜单项，层级 \(top) → \(now)）" : "已按菜单项但层级仍是 \(now)"
+            }
+            return "菜单项「\(it.title)」未勾选（当前未置顶）"
+        }
+
+        return "QQ 里找不到置顶按钮/菜单项（窗口 \(before.count) 个、菜单 \(items.count) 项）"
+    }
+
+    /// QQ 各窗口的当前层级
+    static func qqWindowLayers(_ pid: pid_t) -> [Int] {        let arr = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return arr.compactMap { w in
+            guard (w[kCGWindowOwnerPID as String] as? pid_t) == pid,
+                  let layer = w[kCGWindowLayer as String] as? Int,
+                  layer > 0 else { return nil }
+            return layer
+        }
+    }
+
+    /// 在 QQ 的窗口 AX 树里找置顶按钮
+    static func findPinButton(pid: pid_t) -> AXUIElement? {
+        let keywords = ["置顶", "取消置顶", "窗口置顶", "浮于", "总在最前", "Always on Top", "Pin", "Float", "钉住"]
+        var out: [AXUIElement] = []
+        for w in DockAX.windows(pid: pid) {
+            walkDeep(w, depth: 0, keywords: keywords, into: &out)
+        }
+        // 标题栏右侧的按钮优先（置顶按钮通常在那儿）
+        if let first = out.first {
+            var posRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(first, kAXPositionAttribute as CFString, &posRef)
+            if let b = posRef as? NSDictionary,
+               let p = CGRect(dictionaryRepresentation: b as CFDictionary) {
+                // 取最靠右的一个
+                var best = first, bestX = p.origin.x
+                for e in out.dropFirst() {
+                    var r: CFTypeRef?
+                    AXUIElementCopyAttributeValue(e, kAXPositionAttribute as CFString, &r)
+                    if let bb = r as? NSDictionary, let pp = CGRect(dictionaryRepresentation: bb as CFDictionary), pp.origin.x > bestX {
+                        best = e; bestX = pp.origin.x
+                    }
+                }
+                return best
+            }
+        }
+        return out.first
+    }
+
+    /// 供 dump 用：置顶按钮候选数量
+    static func countPinCandidates(pid: pid_t) -> Int {
+        let keywords = ["置顶", "取消置顶", "窗口置顶", "浮于", "总在最前", "Always on Top", "Pin", "Float", "钉住"]
+        var out: [AXUIElement] = []
+        for w in DockAX.windows(pid: pid) {
+            walkDeep(w, depth: 0, keywords: keywords, into: &out)
+        }
+        return out.count
+    }
+
+    private static func walkDeep(_ el: AXUIElement, depth: Int, keywords: [String], into out: inout [AXUIElement]) {
+        guard depth <= 8 else { return }
+        var roleRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef)
+        let role = roleRef as? String ?? ""
+        if role == (kAXButtonRole as String) || role == (kAXCheckBoxRole as String) ||
+           role == (kAXMenuItemRole as String) || role == (kAXImageRole as String) {
+            var t: CFTypeRef?
+            var d: CFTypeRef?
+            AXUIElementCopyAttributeValue(el, kAXTitleAttribute as CFString, &t)
+            AXUIElementCopyAttributeValue(el, kAXDescriptionAttribute as CFString, &d)
+            let text = ((t as? String) ?? "") + " " + ((d as? String) ?? "")
+            if keywords.contains(where: { text.contains($0) }) { out.append(el) }
+        }
+        var kidsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &kidsRef) == .success,
+              let kids = kidsRef as? [AXUIElement] else { return }
+        for k in kids { walkDeep(k, depth: depth + 1, keywords: keywords, into: &out) }
     }
 
     /// 兜底：直接把窗口层级改成 0（QQ 可能会覆盖回去，仅作诊断）
@@ -665,19 +753,26 @@ final class ClickMonitor {
         return event
     }
 
-    /// 吞点击后的快速关闭：立即发 Esc（程序坞 + 全局各一次），350ms 后复查，
-    /// 没关掉才走完整兜底链
+    /// 吞点击后的快速关闭：不用 Esc（实测会把聚焦搜索唤起来）。
+    /// 用 Docklet 自己的开关通知 + 激活前台应用（启动台是非激活覆盖层，前台一变就收起）
     private func closeLauncherFast() {
-        if let dockPID = DockAX.dockPID() {
-            sendKey(pid: dockPID, code: 0x35)
-        }
-        postGlobalKey(code: 0x35)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+        dismissLauncher()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
             if launcherOverlayOpen() {
                 self.work.async { self.closeLauncher() }
             } else {
-                dlog("关闭启动台：吞点击 + Esc 生效")
+                dlog("关闭启动台：吞点击 + 通知/激活 生效")
             }
+        }
+    }
+
+    /// 关闭启动台（不依赖 Esc）
+    private func dismissLauncher() {
+        DistributedNotificationCenter.default().postNotificationName(
+            NSNotification.Name("com.apple.launchpad.toggle"),
+            object: nil, userInfo: nil, deliverImmediately: true)
+        if let app = NSWorkspace.shared.frontmostApplication {
+            app.activate(options: [.activateAllWindows])
         }
     }
 
@@ -844,20 +939,21 @@ final class ClickMonitor {
         return false
     }
 
-    /// 关闭启动台：界面由**聚焦（Spotlight）**托管，旧版由程序坞自己画，两边都发 Esc。
+    /// 关闭启动台：不用 Esc 打头（实测会把聚焦搜索唤起来）。
+    /// 顺序：Docklet 开关通知 + 激活前台 → 聚焦/程序坞 Esc（仅作最后手段）。
     private func closeLauncher() {
         let t0 = Date()
         func ms() -> Int { Int(Date().timeIntervalSince(t0) * 1000) }
 
-        // ① 全局 Esc：走正常事件流，最快
-        postGlobalKey(code: 0x35)
-        usleep(120_000)
+        // ① toggle 通知 + 激活前台
+        dismissLauncher()
+        usleep(220_000)
         if !launcherOverlayOpen() {
-            dlog("关闭启动台：全局 Esc 生效（\(ms())ms）")
+            dlog("关闭启动台：toggle 通知 / 激活前台 生效（\(ms())ms）")
             return
         }
 
-        // ② 宿主（聚焦）+ 程序坞 Esc，一起发
+        // ② 聚焦 + 程序坞 Esc（已知副作用：可能唤起聚焦搜索，故放最后）
         if let host = launcherHostPID() {
             sendKey(pid: host, code: 0x35)
         }
@@ -865,17 +961,7 @@ final class ClickMonitor {
             sendKey(pid: dockPID, code: 0x35)
         }
         usleep(200_000)
-        if !launcherOverlayOpen() {
-            dlog("关闭启动台：聚焦/程序坞 Esc 生效（\(ms())ms）")
-            return
-        }
-
-        // ③ Docklet 开关通知
-        DistributedNotificationCenter.default().postNotificationName(
-            NSNotification.Name("com.apple.launchpad.toggle"),
-            object: nil, userInfo: nil, deliverImmediately: true)
-        usleep(200_000)
-        dlog("关闭启动台：全部无效 overlayOpen=\(launcherOverlayOpen())（\(ms())ms）")
+        dlog("关闭启动台：Esc 兜底 overlayOpen=\(launcherOverlayOpen())（\(ms())ms）")
     }
 
     /// 全局按键（走正常事件流，前台 app 收到；仅用于「前台 app 自己」的菜单命令）
@@ -1195,6 +1281,9 @@ func runDump() {
             let hit = items.filter { $0.title.contains("置顶") }
                 .map { "\($0.title)[\($0.checked ? "✓" : " ")]" }
             dlog("   QQ 菜单项共 \(items.count) 个；置顶相关：\(hit.isEmpty ? "无" : hit.joined(separator: " , "))")
+        }
+        if app.bundleIdentifier == UnpinQQ.bundleID {
+            dlog("   QQ 窗口层级：\(UnpinQQ.qqWindowLayers(pid).map(String.init).joined(separator: ","))；置顶按钮候选 \(UnpinQQ.countPinCandidates(pid: pid)) 个")
         }
         for (i, w) in wins.enumerated() {
             let title = DockAX.text(w, kAXTitleAttribute as String)
