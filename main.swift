@@ -72,11 +72,14 @@ enum Prefs {
         }
         set { UserDefaults.standard.set(newValue, forKey: "raiseOnSummon") }
     }
-    /// 保护名单：这些应用点图标时完全不收起（访达是系统外壳，收起后桌面和文件窗口全没了）
-    /// 可自行追加，不必重新编译：
-    ///   defaults write com.geekaudio.DockClickMin protectedApps -array com.apple.finder com.tencent.qq
+    /// 保护名单：这些应用点图标时完全不收起。
+    /// 默认含访达（系统外壳）和 QQ —— **QQ 只要被最小化再恢复，就会把自己窗口设成浮动层级**
+    /// （实测：手动点黄色按钮最小化再恢复也照样置顶，是 QQ 自身行为，与工具无关），
+    /// 所以默认不碰它，避免替用户触发这个副作用。
+    /// 可自行增删，不必重新编译：
+    ///   defaults write com.geekaudio.DockClickMin protectedApps -array com.apple.finder
     static var protectedApps: Set<String> {
-        let def = ["com.apple.finder"]
+        let def = ["com.apple.finder", "com.tencent.qq"]
         let arr = UserDefaults.standard.stringArray(forKey: "protectedApps") ?? def
         return Set(arr)
     }

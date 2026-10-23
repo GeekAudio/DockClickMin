@@ -157,22 +157,28 @@ macOS 26 Tahoe 把启动台换成了 `/System/Applications/Apps.app`（`com.appl
 
 ## 保护名单
 
-访达（`com.apple.finder`）默认在保护名单里：点它的图标完全放行，不会收起。
+默认包含**访达**和 **QQ**：点它们的图标完全放行，不会收起。
 
-想再加别的应用，不必重新编译：
+- 访达是系统外壳，收起后桌面和文件窗口全没了
+- **QQ 只要被最小化再恢复，就会把自己窗口设成浮动层级**（表现为「一直被置顶，别的程序盖不住」）。
+  实测用黄色按钮手动最小化再恢复也照样置顶，是 QQ 自身行为，与工具无关 —— 所以默认不碰它，
+  避免替用户触发这个副作用
+
+想改成只保护其中一个，或加别的应用，不必重新编译：
 
 ```bash
-defaults write com.geekaudio.DockClickMin protectedApps -array com.apple.finder com.tencent.qq
-```
+# 只保护 QQ（访达恢复可收起）
+defaults write com.geekaudio.DockClickMin protectedApps -array com.tencent.qq
 
-查看当前名单：
+# 只保护访达（恢复「点图标收起 QQ」）
+defaults write com.geekaudio.DockClickMin protectedApps -array com.apple.finder
 
-```bash
+# 查看当前名单
 defaults read com.geekaudio.DockClickMin protectedApps
 ```
 
-> 注意 `-array` 是**整体覆盖**，要把 `com.apple.finder` 一起写进去；想恢复默认就
-> `defaults delete com.geekaudio.DockClickMin protectedApps`。
+> `-array` 是**整体覆盖**，必须把要保留的一起写进去。
+> 若已经置顶了：退出 QQ 再打开即可解除（实测重启后层级回到 0）。
 
 ## 温和名单
 
