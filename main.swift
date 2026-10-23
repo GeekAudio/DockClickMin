@@ -611,6 +611,40 @@ enum UnpinQQ {
         return out.count
     }
 
+    /// 供 dump 用：主窗口的控件清单（Electron 的按钮常无名称，只能靠角色和位置认）
+    static func dumpWindowControls(pid: pid_t) -> [String] {
+        guard let w = DockAX.windows(pid: pid).first else { return ["（无窗口）"] }
+        var out: [String] = []
+        collectControls(w, depth: 0, into: &out)
+        return out.isEmpty ? ["（没遍历到控件）"] : out
+    }
+
+    private static func collectControls(_ el: AXUIElement, depth: Int, into out: inout [String]) {
+        guard depth <= 4 else { return }
+        var roleRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef)
+        let role = roleRef as? String ?? ""
+        if role == (kAXButtonRole as String) || role == (kAXImageRole as String) ||
+           role == (kAXGroupRole as String) || role == (kAXCheckBoxRole as String) {
+            var t: CFTypeRef?
+            var d: CFTypeRef?
+            AXUIElementCopyAttributeValue(el, kAXTitleAttribute as CFString, &t)
+            AXUIElementCopyAttributeValue(el, kAXDescriptionAttribute as CFString, &d)
+            var posRef: CFTypeRef?
+            var sizeRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(el, kAXPositionAttribute as CFString, &posRef)
+            AXUIElementCopyAttributeValue(el, kAXSizeAttribute as CFString, &sizeRef)
+            let pos = (posRef as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
+            let size = (sizeRef as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
+            let where_ = pos.map { "\(Int($0.origin.x)),\(Int($0.origin.y)) \(Int(size?.width ?? 0))x\(Int(size?.height ?? 0))" } ?? "?"
+            out.append("\(role) 「\((t as? String) ?? "")」 desc=\"\((d as? String) ?? "")\" @ \(where_)")
+        }
+        var kidsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &kidsRef) == .success,
+              let kids = kidsRef as? [AXUIElement] else { return }
+        for k in kids { collectControls(k, depth: depth + 1, into: &out) }
+    }
+
     private static func walkDeep(_ el: AXUIElement, depth: Int, keywords: [String], into out: inout [AXUIElement]) {
         guard depth <= 8 else { return }
         var roleRef: CFTypeRef?
@@ -766,14 +800,18 @@ final class ClickMonitor {
         }
     }
 
-    /// 关闭启动台（不依赖 Esc）
+    /// 关闭启动台。启动台是**非激活覆盖层**，前台一变就收起；但激活「已经在台前」的应用是空操作，
+    /// 所以要先激活一个替身应用，再切回原来的。hide()/terminate() 对聚焦都无效（实测）。
     private func dismissLauncher() {
-        DistributedNotificationCenter.default().postNotificationName(
-            NSNotification.Name("com.apple.launchpad.toggle"),
-            object: nil, userInfo: nil, deliverImmediately: true)
-        if let app = NSWorkspace.shared.frontmostApplication {
-            app.activate(options: [.activateAllWindows])
+        guard let keep = NSWorkspace.shared.frontmostApplication, !keep.isTerminated else { return }
+        let others = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular && !$0.isTerminated && $0.processIdentifier != keep.processIdentifier
         }
+        // 替身优先访达（最不容易抢戏），没有就随便挑一个
+        guard let sub = others.first(where: { $0.bundleIdentifier == "com.apple.finder" }) ?? others.first else { return }
+        sub.activate(options: [])
+        usleep(180_000)
+        keep.activate(options: [])
     }
 
     // 以下三个方法都在串行队列 work 上执行，pending 无需加锁
@@ -940,20 +978,30 @@ final class ClickMonitor {
     }
 
     /// 关闭启动台：不用 Esc 打头（实测会把聚焦搜索唤起来）。
-    /// 顺序：Docklet 开关通知 + 激活前台 → 聚焦/程序坞 Esc（仅作最后手段）。
+    /// 顺序：替身激活法（切前台）→ toggle 通知 → Esc（仅作最后手段）。
     private func closeLauncher() {
         let t0 = Date()
         func ms() -> Int { Int(Date().timeIntervalSince(t0) * 1000) }
 
-        // ① toggle 通知 + 激活前台
+        // ① 替身激活：激活别的应用再切回，覆盖层就收了
         dismissLauncher()
-        usleep(220_000)
+        usleep(120_000)
         if !launcherOverlayOpen() {
-            dlog("关闭启动台：toggle 通知 / 激活前台 生效（\(ms())ms）")
+            dlog("关闭启动台：替身激活生效（\(ms())ms）")
             return
         }
 
-        // ② 聚焦 + 程序坞 Esc（已知副作用：可能唤起聚焦搜索，故放最后）
+        // ② Docklet 开关通知
+        DistributedNotificationCenter.default().postNotificationName(
+            NSNotification.Name("com.apple.launchpad.toggle"),
+            object: nil, userInfo: nil, deliverImmediately: true)
+        usleep(180_000)
+        if !launcherOverlayOpen() {
+            dlog("关闭启动台：toggle 通知生效（\(ms())ms）")
+            return
+        }
+
+        // ③ 聚焦 + 程序坞 Esc（已知副作用：可能唤起聚焦搜索，故放最后）
         if let host = launcherHostPID() {
             sendKey(pid: host, code: 0x35)
         }
@@ -1284,6 +1332,10 @@ func runDump() {
         }
         if app.bundleIdentifier == UnpinQQ.bundleID {
             dlog("   QQ 窗口层级：\(UnpinQQ.qqWindowLayers(pid).map(String.init).joined(separator: ","))；置顶按钮候选 \(UnpinQQ.countPinCandidates(pid: pid)) 个")
+            dlog("   QQ 主窗口控件：")
+            for line in UnpinQQ.dumpWindowControls(pid: pid).prefix(40) {
+                dlog("     \(line)")
+            }
         }
         for (i, w) in wins.enumerated() {
             let title = DockAX.text(w, kAXTitleAttribute as String)
