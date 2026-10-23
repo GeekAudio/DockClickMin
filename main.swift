@@ -91,6 +91,13 @@ enum Prefs {
         let arr = UserDefaults.standard.stringArray(forKey: "gentleApps") ?? def
         return Set(arr)
     }
+    /// 这些应用「从最小化恢复」时走 AX 恢复，不让 Dock 参与。
+    /// 用来验证 QQ 的置顶是不是 Dock 恢复路径触发的。默认含 QQ，可自行增删。
+    static var axRestoreApps: Set<String> {
+        let def = ["com.tencent.qq"]
+        let arr = UserDefaults.standard.stringArray(forKey: "axRestoreApps") ?? def
+        return Set(arr)
+    }
 }
 
 // MARK: - 开机自启（LaunchAgent，登录时 launchd 自动加载，无需 root）
@@ -542,6 +549,8 @@ final class ClickMonitor {
     }
 
     private var swallowUp = false
+    /// 非 nil 表示「这次抬起要改走 AX 恢复」——用来绕开 Dock 的恢复路径
+    private var axRestorePID: pid_t?
 
     /// 返回 nil = 吞掉这次事件；返回 event = 原样放行
     fileprivate func handle(type: CGEventType, event: CGEvent) -> CGEvent? {
@@ -570,9 +579,25 @@ final class ClickMonitor {
                 closeLauncherFast()
                 return nil
             }
+            // 实验路径：名单内应用（默认 QQ）已全部最小化时，抬起改走 AX 恢复，
+            // 不让 Dock 执行它自己的恢复 —— 用来看置顶是不是 Dock 恢复路径触发的
+            if let t = TileCache.shared.tiles.first(where: { $0.rect.contains(loc) }),
+               let bid = t.bundleID, Prefs.axRestoreApps.contains(bid), t.pid > 0 {
+                let st = DockAX.windowStats(pid: t.pid)
+                if st.total > 0, st.minimized >= st.total {
+                    axRestorePID = t.pid
+                    dlog("\(t.name) 已最小化 → 抬起时改用 AX 恢复（绕开 Dock）")
+                }
+            }
             let front = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
             work.async { self.onDown(loc, front) }
         case .leftMouseUp:
+            if let pid = axRestorePID {
+                axRestorePID = nil
+                swallowUp = false
+                work.async { self.axRestore(pid) }
+                return nil                      // 吞掉，Dock 就不执行它的恢复
+            }
             if swallowUp {
                 swallowUp = false
                 return nil
@@ -686,6 +711,19 @@ final class ClickMonitor {
 
     /// 把应用的主窗口提到最前（AXRaise）。
     /// 只能越过同层级窗口；压不过别的应用设置的浮动层级窗口（例如 QQ 的置顶面板）。
+    /// 用 AX 直接恢复（不让 Dock 参与），用于验证置顶是不是 Dock 恢复路径触发的
+    private func axRestore(_ pid: pid_t) {
+        let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "?"
+        DockAX.restoreAll(pid: pid)
+        usleep(150_000)
+        if let app = NSRunningApplication(processIdentifier: pid) {
+            app.activate(options: [])
+        }
+        usleep(250_000)
+        let st = DockAX.windowStats(pid: pid)
+        dlog("AX 恢复 \(name)：\(st.minimized)/\(st.total) 已恢复")
+    }
+
     private func raiseApp(pid: pid_t) {
         // 刚收起过它就别再拉回来，否则会出现「先置顶、再点一下才最小化」的错乱
         if Date() < suppressRaiseUntil { return }
