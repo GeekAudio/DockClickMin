@@ -77,6 +77,14 @@ enum Prefs {
         get { UserDefaults.standard.bool(forKey: "unpinQQ") }
         set { UserDefaults.standard.set(newValue, forKey: "unpinQQ") }
     }
+    /// 保护名单：这些应用点图标时完全不收起（访达是系统外壳，收起后桌面和文件窗口全没了）
+    /// 可自行追加，不必重新编译：
+    ///   defaults write com.geekaudio.DockClickMin protectedApps -array com.apple.finder com.tencent.qq
+    static var protectedApps: Set<String> {
+        let def = ["com.apple.finder"]
+        let arr = UserDefaults.standard.stringArray(forKey: "protectedApps") ?? def
+        return Set(arr)
+    }
 }
 
 // MARK: - 开机自启（LaunchAgent，登录时 launchd 自动加载，无需 root）
@@ -669,6 +677,12 @@ final class ClickMonitor {
             // 而且可能「先关后开」。统一放到 mouseUp 之后发。
             pending = (DockTile(pid: -1, name: tile.name, bundleID: tile.bundleID, rect: tile.rect), p)
             dlog("启动台开着 → 抬起后关闭")
+            return
+        }
+
+        // 保护名单（默认含访达）：完全放行，交给系统原生行为
+        if let bid = tile.bundleID, Prefs.protectedApps.contains(bid) {
+            dlog("跳过 \(tile.name)（保护名单）")
             return
         }
 

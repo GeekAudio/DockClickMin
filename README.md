@@ -138,6 +138,7 @@ macOS 26 Tahoe 把启动台换成了 `/System/Applications/Apps.app`（`com.appl
 | 点**非**前台的 Dock 图标 | 正常切换，不收起 | 按下时的前台 pid ≠ 图标 pid |
 | 窗口已全部最小化时点图标 | **原生恢复所有窗口** | 主动放行，不抢系统行为 |
 | 点**启动台**图标且它正开着 | 关闭它（Esc → hide → terminate） | 启动器没有最小化语义 |
+| 点**访达**图标 | 完全放行，不收起 | 访达是系统外壳，收起后桌面和文件窗口全没了 |
 | 按住 ⌘/⌥/⌃/⇧ 点 | 完全放行 | 保留 ⌥-click 隐藏其他等原生操作 |
 | 图标内按下后拖拽（≥8pt） | 不触发 | 防止拖拽排序图标时误收起 |
 | app 一个窗口都没有 | 放行，走原生「打开新窗口」 | 否则会把「重新打开窗口」吃掉 |
@@ -147,6 +148,25 @@ macOS 26 Tahoe 把启动台换成了 `/System/Applications/Apps.app`（`com.appl
 | 唤出时提到最前 | 对普通应用有效，**压不过别的应用设置的浮动层级窗口** | `AXRaise` 只能越过同层级窗口；QQ 的置顶面板在 layer 3 |
 
 > 关于「QQ 一直置顶，别的程序盖不住」：这是 QQ 自己把窗口设成了浮动层级（CGWindow `layer=3`，正常窗口是 0），本工具从不修改窗口层级。在 QQ 里取消置顶即可（主面板标题栏的图钉 / 菜单里的「置顶」）。
+
+## 保护名单
+
+访达（`com.apple.finder`）默认在保护名单里：点它的图标完全放行，不会收起。
+
+想再加别的应用，不必重新编译：
+
+```bash
+defaults write com.geekaudio.DockClickMin protectedApps -array com.apple.finder com.tencent.qq
+```
+
+查看当前名单：
+
+```bash
+defaults read com.geekaudio.DockClickMin protectedApps
+```
+
+> 注意 `-array` 是**整体覆盖**，要把 `com.apple.finder` 一起写进去；想恢复默认就
+> `defaults delete com.geekaudio.DockClickMin protectedApps`。
 
 ## 重编译会掉授权
 
