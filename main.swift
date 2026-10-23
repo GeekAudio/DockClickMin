@@ -229,6 +229,19 @@ enum DockAX {
     }
     static func rect(_ el: AXUIElement) -> CGRect? { frame(el) }
 
+    /// 顶层菜单标题（用来判断 app 有没有「隐藏 / 最小化 / 关闭」这些菜单项）
+    static func menuBarTitles(pid: pid_t) -> [String]? {
+        let appEl = AXUIElementCreateApplication(pid)
+        var barRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appEl, kAXMenuBarAttribute as CFString, &barRef) == .success,
+              let b = barRef, CFGetTypeID(b) == AXUIElementGetTypeID() else { return nil }
+        let bar = unsafeBitCast(b, to: AXUIElement.self)
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(bar, kAXChildrenAttribute as CFString, &v) == .success,
+              let items = v as? [AXUIElement] else { return nil }
+        return items.compactMap { str($0, kAXTitleAttribute as String) }.filter { !$0.isEmpty }
+    }
+
     private static func collect(_ el: AXUIElement, depth: Int, into out: inout [DockTile]) {
         guard depth <= 5, let kids = children(el) else { return }
         for k in kids {
@@ -556,7 +569,15 @@ final class ClickMonitor {
             closeLauncher()
             return
         }
-        guard NSRunningApplication(processIdentifier: tile.pid) != nil else { return }
+        guard let app = NSRunningApplication(processIdentifier: tile.pid) else { return }
+
+        // 先确保它真的成为前台：AX 动作只对 key window 生效，而我们的动作在 mouseUp 后
+        // 十几毫秒就跑了，可能早于系统完成激活（Clash Verge 这类 app 因此时灵时不灵）
+        if !app.isActive {
+            app.activate(options: [])
+            usleep(70_000)
+        }
+
         switch Prefs.mode {
         case .hide:
             dlog("收起 \(tile.name)：\(hideApp(pid: tile.pid))")
@@ -915,6 +936,9 @@ func runDump() {
         guard !wins.isEmpty else { continue }
         let (t, m) = DockAX.windowStats(pid: pid)
         dlog("\(app.localizedName ?? "?") pid=\(pid) 窗口=\(t) 已最小化=\(m) 前台=\(app.isActive)")
+        if let menus = DockAX.menuBarTitles(pid: pid) {
+            dlog("   菜单: \(menus.joined(separator: " | "))")
+        }
         for (i, w) in wins.enumerated() {
             let title = DockAX.text(w, kAXTitleAttribute as String)
             let sub = DockAX.text(w, kAXSubroleAttribute as String)
