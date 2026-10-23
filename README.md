@@ -33,9 +33,11 @@ CGEventTap(左键 down/up) ─┴─► 按下：记住当时的前台 pid
 
 ## 安装
 
-### 方式一：下载 Release
+### 方式一：下载 DMG
 
-从 [Releases](../../releases) 下载 `DockClickMin-<version>.zip`，解压后拖进「应用程序」。
+从 [Releases](../../releases) 下载 `DockClickMin-<version>.dmg`，打开后把 `DockClickMin.app` 拖到旁边的 `Applications` 快捷方式。
+
+DMG 里还有一份 `使用说明.html`（不含下载链接，适合随包分发）：双击即可看安装、菜单、常见问题。
 
 首次打开会被 Gatekeeper 拦（ad-hoc 签名）：
 

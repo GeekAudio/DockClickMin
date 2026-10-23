@@ -9,3 +9,4 @@ build/
 
 # 图标中间产物（icns 与主图入库）
 assets/AppIcon.iconset/
+*.dmg
