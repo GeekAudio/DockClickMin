@@ -411,6 +411,27 @@ func launcherOverlayOpen() -> Bool {
     dockWindows().contains { $0.layer >= 26 }
 }
 
+/// 屏幕窗口栈里最上层的「普通窗口」（layer 0）属于谁。
+/// 用途：窗口已经在最上面、但系统不认为它是活跃应用时，点它的图标应当直接收起，而不是先"切换"。
+func topmostNormalWindowPID() -> pid_t? {
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return nil }
+    let me = getpid()
+    let dockPID = DockAX.dockPID()
+    for w in list {
+        guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
+        guard let pid = w[kCGWindowOwnerPID as String] as? pid_t else { continue }
+        if pid == me || pid == dockPID { continue }
+        let alpha = w[kCGWindowAlpha as String] as? Double ?? 1
+        if alpha <= 0.01 { continue }
+        guard let b = w[kCGWindowBounds as String] as? NSDictionary,
+              let rect = CGRect(dictionaryRepresentation: b as CFDictionary),
+              rect.width > 40, rect.height > 40 else { continue }
+        return pid
+    }
+    return nil
+}
+
 // MARK: - 事件监听
 
 final class ClickMonitor {
@@ -540,7 +561,7 @@ final class ClickMonitor {
         // 埋点：只记落在 Dock 区域/图标上的点击，平时很安静，排错时能定位到具体哪一步断了
         if inBand || hit != nil {
             let h = hit.map { "\($0.name)|\($0.bundleID ?? "-")|pid=\($0.pid)" } ?? "nil"
-            dlog("DOWN#\(downSeen) \(Int(p.x)),\(Int(p.y)) inBand=\(inBand) tiles=\(tiles.count) hit=\(h) front=\(front) overlay=\(launcherOverlayOpen())")
+            dlog("DOWN#\(downSeen) \(Int(p.x)),\(Int(p.y)) inBand=\(inBand) tiles=\(tiles.count) hit=\(h) front=\(front) top=\(topmostNormalWindowPID().map(String.init) ?? "-") overlay=\(launcherOverlayOpen())")
         }
 
         guard inBand, let tile = hit else { return }
@@ -557,7 +578,9 @@ final class ClickMonitor {
         }
 
         // 点的是别的应用 ⇒ 交给系统切换，但抬起后把它的窗口提到最前
-        if tile.pid != front {
+        // 例外：它的窗口已经在窗口栈最上层（只是不是"活跃应用"）时，直接收起，一步到位
+        let topPID = topmostNormalWindowPID()
+        if tile.pid != front && tile.pid != topPID {
             if Prefs.raiseOnSummon { raisePending = tile.pid }
             return
         }
