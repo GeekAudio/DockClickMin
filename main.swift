@@ -118,10 +118,11 @@ enum AutoStart {
         try? FileManager.default.removeItem(at: plistURL)
     }
 
-    /// 启动时对齐：勾选 ⇒ 确保 plist 存在；取消 ⇒ 删掉
+    /// 启动时对齐：勾选 ⇒ 每次启动都按当前可执行路径重写 plist（app 移动/换目录后自愈）；
+    /// 取消 ⇒ 删掉
     static func sync() {
         if Prefs.autoStart {
-            if !installed { ensure() }
+            ensure()
         } else if installed {
             disable()
         }
@@ -555,16 +556,51 @@ final class ClickMonitor {
             closeLauncher()
             return
         }
-        guard let app = NSRunningApplication(processIdentifier: tile.pid) else { return }
+        guard NSRunningApplication(processIdentifier: tile.pid) != nil else { return }
         switch Prefs.mode {
         case .hide:
-            let ok = app.hide()
-            dlog("收起 \(tile.name)（hide ok=\(ok)）")
+            dlog("收起 \(tile.name)：\(hideApp(pid: tile.pid))")
         case .minimize:
             let r = minimizeAll(pid: tile.pid)
             dlog("收起 \(tile.name)：\(r)")
         }
         TileCache.shared.refresh()
+    }
+
+    /// 隐藏整个应用，三级回退（`hide()` 对 helper / 无 Hide 菜单的 app 会直接返回 false）：
+    ///   ① NSRunningApplication.hide()
+    ///   ② AX 置 AXHidden = true
+    ///   ③ 发 ⌘H
+    private func hideApp(pid: pid_t) -> String {
+        guard let app = NSRunningApplication(processIdentifier: pid) else { return "无进程" }
+        var report: [String] = []
+
+        if app.hide() {
+            return "hide() 成功"
+        }
+        report.append("hide()=false")
+
+        let el = AXUIElementCreateApplication(pid)
+        if AXUIElementSetAttributeValue(el, kAXHiddenAttribute as CFString, kCFBooleanTrue) == .success {
+            usleep(80_000)
+            if isHidden(el, app) { return report.joined(separator: " / ") + " / AXHidden 成功" }
+        }
+        report.append("AXHidden 无效")
+
+        sendKey(pid: pid, code: 0x04, flags: .maskCommand)   // ⌘H
+        usleep(150_000)
+        if isHidden(el, app) { return report.joined(separator: " / ") + " / ⌘H 成功" }
+
+        report.append("⌘H 无效")
+        return report.joined(separator: " / ")
+    }
+
+    private func isHidden(_ el: AXUIElement, _ app: NSRunningApplication) -> Bool {
+        if app.isHidden { return true }
+        var v: CFTypeRef?
+        if AXUIElementCopyAttributeValue(el, kAXHiddenAttribute as CFString, &v) == .success,
+           let b = v as? Bool { return b }
+        return false
     }
 
     /// 关闭启动台：覆盖层是**程序坞进程自己画的**，没有独立 app 可关。

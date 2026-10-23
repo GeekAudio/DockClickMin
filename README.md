@@ -48,10 +48,13 @@ CGEventTap(左键 down/up) ─┴─► 按下：记住当时的前台 pid
 ```bash
 git clone https://github.com/GeekAudio/DockClickMin.git
 cd DockClickMin
-./build.sh run        # 编译 + ad-hoc 签名 + 启动
+./build.sh            # 编译 + ad-hoc 签名
+./install.sh          # 拷到 /Applications 并启动（已存在则加 --force）
 ```
 
 需要 Xcode Command Line Tools（`xcode-select --install`）。产物是通用二进制（x86_64 + arm64）。
+
+> 建议装到 `/Applications`：工作区里的那份是开发副本，`./build.sh` 每次都会覆盖它；装到 `/Applications` 后开机自启、Finder 里双击、辅助功能列表里的条目都指向同一个位置。
 
 ### 授权（两种方式都要做）
 
@@ -79,7 +82,9 @@ cd DockClickMin
 | 方式 | 实现 | 动画 |
 |---|---|---|
 | **最小化窗口**（默认） | 三级回退，每级都验证结果 | ✅ 前两级有 |
-| 隐藏整个应用 | `NSRunningApplication.hide()` | ❌ 瞬时 |
+| 隐藏整个应用 | 三级回退：`hide()` → `AXHidden` → ⌘H | ❌ 瞬时 |
+
+**为什么隐藏也要三级**：`NSRunningApplication.hide()` 对 helper 类、没有「隐藏」菜单项的 app 会直接返回 `false`（实测 TCC Helper 就是 `hide ok=false`）。所以隐藏同样要验证，再依次退到 AX 的 `AXHidden`、最后发 ⌘H。
 
 三级回退（`minimizeAll`）：
 
