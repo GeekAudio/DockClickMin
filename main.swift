@@ -64,6 +64,14 @@ enum Prefs {
         }
         set { UserDefaults.standard.set(newValue, forKey: "autoStart") }
     }
+    /// 唤出应用时把窗口提到最前，默认开
+    static var raiseOnSummon: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: "raiseOnSummon") == nil { return true }
+            return UserDefaults.standard.bool(forKey: "raiseOnSummon")
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "raiseOnSummon") }
+    }
 }
 
 // MARK: - 开机自启（LaunchAgent，登录时 launchd 自动加载，无需 root）
@@ -411,6 +419,7 @@ final class ClickMonitor {
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
     private var pending: (tile: DockTile, down: CGPoint)?
+    private var raisePending: pid_t?
     private let work = DispatchQueue(label: "com.geekaudio.dockclickmin.work")
     private(set) var lastError: String?
 
@@ -545,10 +554,18 @@ final class ClickMonitor {
             return
         }
 
-        guard tile.pid == front else { return }          // 点的是别的 app ⇒ 交给系统
-        // 无窗口 ⇒ 保留原生「打开新窗口」；窗口已全部最小化 ⇒ 保留原生「点图标恢复」
+        // 点的是别的应用 ⇒ 交给系统切换，但抬起后把它的窗口提到最前
+        if tile.pid != front {
+            if Prefs.raiseOnSummon { raisePending = tile.pid }
+            return
+        }
+
+        // 无窗口 / 窗口已全部最小化 ⇒ 系统会自己「打开新窗口 / 恢复所有窗口」，之后也提一下
         let stats = DockAX.windowStats(pid: tile.pid)
-        guard stats.total > 0, stats.minimized < stats.total else { return }
+        guard stats.total > 0, stats.minimized < stats.total else {
+            if Prefs.raiseOnSummon { raisePending = tile.pid }
+            return
+        }
         pending = (tile, p)
     }
 
@@ -558,10 +575,29 @@ final class ClickMonitor {
     }
 
     private func onUp(_ p: CGPoint) {
+        if let pid = raisePending {
+            raisePending = nil
+            // 等 Dock 完成激活 / 恢复窗口，再把窗口提到最前
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.16) { [weak self] in
+                self?.raiseApp(pid: pid)
+            }
+        }
         guard let (tile, down) = pending else { return }
         pending = nil
         guard hypot(p.x - down.x, p.y - down.y) < 8, tile.rect.contains(p) else { return }
         act(tile)
+    }
+
+    /// 把应用的主窗口提到最前（AXRaise）。
+    /// 只能越过同层级窗口；压不过别的应用设置的浮动层级窗口（例如 QQ 的置顶面板）。
+    private func raiseApp(pid: pid_t) {
+        guard let app = NSRunningApplication(processIdentifier: pid) else { return }
+        if !app.isActive { app.activate(options: []) }
+        guard let w = DockAX.windows(pid: pid).first else { return }
+        var mini: CFTypeRef?
+        if AXUIElementCopyAttributeValue(w, kAXMinimizedAttribute as CFString, &mini) == .success,
+           let b = mini as? Bool, b { return }      // 还最小化的交给系统恢复
+        AXUIElementPerformAction(w, kAXRaiseAction as CFString)
     }
 
     private func act(_ tile: DockTile) {
@@ -853,6 +889,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         auto.state = Prefs.autoStart ? .on : .off
         menu.addItem(auto)
 
+        let raise = NSMenuItem(title: "唤出时提到最前", action: #selector(toggleRaise), keyEquivalent: "")
+        raise.target = self
+        raise.state = Prefs.raiseOnSummon ? .on : .off
+        menu.addItem(raise)
+
         let minimizeItem = NSMenuItem(title: "收起方式：最小化窗口（原生动画）", action: #selector(useMinimize), keyEquivalent: "")
         minimizeItem.target = self
         minimizeItem.state = Prefs.mode == .minimize ? .on : .off
@@ -893,6 +934,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Prefs.autoStart.toggle()
         AutoStart.sync()
         dlog("开机自启=\(Prefs.autoStart)，LaunchAgent 存在=\(AutoStart.installed)")
+        rebuild()
+    }
+
+    @objc private func toggleRaise() {
+        Prefs.raiseOnSummon.toggle()
         rebuild()
     }
 
