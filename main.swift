@@ -56,6 +56,76 @@ enum Prefs {
         }
         set { UserDefaults.standard.set(newValue, forKey: "enabled") }
     }
+    /// 开机自启，默认开（key 不存在时按 true 处理）
+    static var autoStart: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: "autoStart") == nil { return true }
+            return UserDefaults.standard.bool(forKey: "autoStart")
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "autoStart") }
+    }
+}
+
+// MARK: - 开机自启（LaunchAgent，登录时 launchd 自动加载，无需 root）
+
+enum AutoStart {
+    static let label = "com.geekaudio.DockClickMin"
+
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+
+    static var installed: Bool { FileManager.default.fileExists(atPath: plistURL.path) }
+
+    /// 写入/更新 plist（每次启动都对齐当前路径，app 被移动也能自愈）
+    @discardableResult
+    static func ensure() -> Bool {
+        guard let exe = Bundle.main.executableURL?.path else { return false }
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key><string>\(label)</string>
+            <key>ProgramArguments</key>
+            <array><string>\(exe)</string></array>
+            <key>RunAtLoad</key><true/>
+            <key>ProcessType</key><string>Interactive</string>
+        </dict>
+        </plist>
+        """
+        let dir = plistURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        do {
+            try xml.write(to: plistURL, atomically: true, encoding: .utf8)
+            return true
+        } catch {
+            dlog("开机自启写入失败：\(error.localizedDescription)")
+            return false
+        }
+    }
+
+    static func disable() {
+        let uid = getuid()
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["bootout", "gui/\(uid)/\(label)"]
+        p.standardError = FileHandle.nullDevice
+        p.standardOutput = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+        try? FileManager.default.removeItem(at: plistURL)
+    }
+
+    /// 启动时对齐：勾选 ⇒ 确保 plist 存在；取消 ⇒ 删掉
+    static func sync() {
+        if Prefs.autoStart {
+            if !installed { ensure() }
+        } else if installed {
+            disable()
+        }
+    }
 }
 
 // MARK: - 辅助功能权限
@@ -70,8 +140,14 @@ func axTrusted(prompt: Bool = false) -> Bool {
 struct DockTile {
     let pid: pid_t
     let name: String
+    let bundleID: String?
     let rect: CGRect
 }
+
+/// 启动台 / Launchpad 这类「全屏启动器」不是普通 app：点图标应当**关闭**它，不是最小化
+let kLauncherIDs: Set<String> = ["com.apple.apps.launcher",     // macOS 26 Tahoe 的 Apps.app
+                                 "com.apple.launchpad.launcher"] // 老 Launchpad
+let kLauncherNames: Set<String> = ["启动台", "Launchpad", "App", "Apps"]
 
 enum DockAX {
     static func dockPID() -> pid_t? {
@@ -155,7 +231,9 @@ enum DockAX {
     private static func collect(_ el: AXUIElement, depth: Int, into out: inout [DockTile]) {
         guard depth <= 5, let kids = children(el) else { return }
         for k in kids {
-            if str(k, kAXSubroleAttribute as String) == "AXApplicationDockItem" {
+            let sub = str(k, kAXSubroleAttribute as String) ?? ""
+            // 放宽：AXApplicationDockItem / AXFolderDockItem / AXURLDockItem … 只要是个 Dock 图标都收
+            if sub.hasSuffix("DockItem") {
                 if let t = tile(k) { out.append(t) }
             } else {
                 collect(k, depth: depth + 1, into: &out)
@@ -165,14 +243,26 @@ enum DockAX {
 
     private static func tile(_ el: AXUIElement) -> DockTile? {
         guard let rect = frame(el), rect.width > 4, rect.height > 4 else { return nil }
-        guard let app = runningApp(el) else { return nil }
-        return DockTile(pid: app.processIdentifier,
-                        name: app.localizedName ?? "?",
-                        rect: rect)
+        let title = str(el, kAXTitleAttribute as String) ?? "?"
+        var bid = bundleID(el)
+        // 启动台这类图标可能拿不到 AXURL，用标题兜底映射
+        if bid == nil, kLauncherNames.contains(title) { bid = "com.apple.apps.launcher" }
+
+        if let app = runningApp(el, bundleID: bid) {
+            return DockTile(pid: app.processIdentifier,
+                            name: app.localizedName ?? title,
+                            bundleID: bid ?? app.bundleIdentifier,
+                            rect: rect)
+        }
+        // 未运行但有 bundle id（启动台这类按需启动的 LSUIElement）：保留矩形，点击时再实时查进程
+        if let bid = bid {
+            return DockTile(pid: -1, name: title, bundleID: bid, rect: rect)
+        }
+        return nil
     }
 
-    private static func runningApp(_ el: AXUIElement) -> NSRunningApplication? {
-        if let bid = bundleID(el),
+    private static func runningApp(_ el: AXUIElement, bundleID bid: String?) -> NSRunningApplication? {
+        if let bid = bid,
            let app = NSRunningApplication.runningApplications(withBundleIdentifier: bid).first {
             return app
         }
@@ -269,20 +359,34 @@ final class TileCache {
     }
 }
 
-// MARK: - Dock 窗口范围（诊断用；注意：中文系统 owner 名是「程序坞」不是 Dock）
+// MARK: - Dock 窗口（注意：中文系统 owner 名是「程序坞」不是 Dock，只能按 pid 认）
 
-func dockWindowFrames() -> [CGRect] {
+struct DockWindowInfo {
+    let layer: Int
+    let rect: CGRect
+}
+
+func dockWindows() -> [DockWindowInfo] {
     guard let dockPID = DockAX.dockPID() else { return [] }
     let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
     guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return [] }
-    var out: [CGRect] = []
+    var out: [DockWindowInfo] = []
     for w in list {
         guard let pid = w[kCGWindowOwnerPID as String] as? pid_t, pid == dockPID else { continue }
-        guard let b = w[kCGWindowBounds as String] as? NSDictionary,
-              let rect = CGRect(dictionaryRepresentation: b as CFDictionary) else { continue }
-        out.append(rect)
+        let layer = w[kCGWindowLayer as String] as? Int ?? 0
+        let rect = (w[kCGWindowBounds as String] as? NSDictionary)
+            .flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) } ?? .zero
+        out.append(DockWindowInfo(layer: layer, rect: rect))
     }
     return out
+}
+
+func dockWindowFrames() -> [CGRect] { dockWindows().map { $0.rect } }
+
+/// 启动台开着时，程序坞会多出全屏覆盖层窗口，layer 从 20 升到 27/29。
+/// 关闭时只有 layer=20 那一个。实测依据见 README。
+func launcherOverlayOpen() -> Bool {
+    dockWindows().contains { $0.layer >= 26 }
 }
 
 // MARK: - 事件监听
@@ -305,11 +409,13 @@ final class ClickMonitor {
         let mask = (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.leftMouseUp.rawValue)
         guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap,
                                         place: .headInsertEventTap,
-                                        options: .listenOnly,
+                                        options: .defaultTap,
                                         eventsOfInterest: CGEventMask(mask),
                                         callback: { _, type, event, _ in
-                                            ClickMonitor.shared.handle(type: type, event: event)
-                                            return Unmanaged.passUnretained(event)
+                                            if let out = ClickMonitor.shared.handle(type: type, event: event) {
+                                                return Unmanaged.passUnretained(out)
+                                            }
+                                            return nil          // 吞掉这次事件
                                         },
                                         userInfo: nil) else {
             lastError = "tapCreate 失败（缺「辅助功能」或「输入监控」权限）"
@@ -335,45 +441,106 @@ final class ClickMonitor {
         dlog("事件监听已停止")
     }
 
-    fileprivate func handle(type: CGEventType, event: CGEvent) {
+    private var swallowUp = false
+
+    /// 返回 nil = 吞掉这次事件；返回 event = 原样放行
+    fileprivate func handle(type: CGEventType, event: CGEvent) -> CGEvent? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
             dlog("tap 被系统临时禁用，已重新启用")
-            return
+            return event
         }
-        guard Prefs.enabled else { return }
+        guard Prefs.enabled else { return event }
 
         // 带修饰键时完全放行：保留 ⌥-click「隐藏其他」、⌘-click 等原生行为
         let mods: CGEventFlags = [.maskCommand, .maskAlternate, .maskControl, .maskShift]
         if !event.flags.intersection(mods).isEmpty {
             work.async { self.pending = nil }
-            return
+            return event
         }
 
         let loc = event.location
         switch type {
         case .leftMouseDown:
+            // 启动台快速路径：只用缓存矩形判断（几微秒），命中就吞掉这次点击，
+            // 让程序坞完全不处理它，同时立刻发 Esc —— 这样没有「关掉又被点开」的竞争。
+            if let t = TileCache.shared.tiles.first(where: { $0.rect.contains(loc) }),
+               isLauncher(t), launcherOverlayOpen() {
+                swallowUp = true
+                closeLauncherFast()
+                return nil
+            }
             let front = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
             work.async { self.onDown(loc, front) }
         case .leftMouseUp:
+            if swallowUp {
+                swallowUp = false
+                return nil
+            }
             work.async { self.onUp(loc) }
         default:
             break
+        }
+        return event
+    }
+
+    /// 吞点击后的快速关闭：立即发 Esc（程序坞 + 全局各一次），350ms 后复查，
+    /// 没关掉才走完整兜底链
+    private func closeLauncherFast() {
+        if let dockPID = DockAX.dockPID() {
+            sendKey(pid: dockPID, code: 0x35)
+        }
+        postGlobalKey(code: 0x35)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            if launcherOverlayOpen() {
+                self.work.async { self.closeLauncher() }
+            } else {
+                dlog("关闭启动台：吞点击 + Esc 生效")
+            }
         }
     }
 
     // 以下三个方法都在串行队列 work 上执行，pending 无需加锁
 
+    private var downSeen = 0
+
     private func onDown(_ p: CGPoint, _ front: pid_t) {
+        downSeen += 1
         pending = nil
         let band = TileCache.shared.band
-        guard !band.isNull, band.contains(p) else { return }
-        guard let tile = DockAX.tiles().first(where: { $0.rect.contains(p) }) else { return }
+        let inBand = !band.isNull && band.contains(p)
+        let tiles = DockAX.tiles()
+        let hit = tiles.first(where: { $0.rect.contains(p) })
+
+        // 埋点：只记落在 Dock 区域/图标上的点击，平时很安静，排错时能定位到具体哪一步断了
+        if inBand || hit != nil {
+            let h = hit.map { "\($0.name)|\($0.bundleID ?? "-")|pid=\($0.pid)" } ?? "nil"
+            dlog("DOWN#\(downSeen) \(Int(p.x)),\(Int(p.y)) inBand=\(inBand) tiles=\(tiles.count) hit=\(h) front=\(front) overlay=\(launcherOverlayOpen())")
+        }
+
+        guard inBand, let tile = hit else { return }
+
+        // 启动台：点图标 = 关闭它（启动器没有「最小化」语义，也不该看窗口数）
+        if isLauncher(tile) {
+            // 必须用「按下时」的状态判断：抬起时原生可能已经把覆盖层打开了
+            guard launcherOverlayOpen() else { return }   // 关着 ⇒ 让原生去打开
+            // 注意：不在这里发 Esc。按下就发会被这次点击的处理压住，反而更慢，
+            // 而且可能「先关后开」。统一放到 mouseUp 之后发。
+            pending = (DockTile(pid: -1, name: tile.name, bundleID: tile.bundleID, rect: tile.rect), p)
+            dlog("启动台开着 → 抬起后关闭")
+            return
+        }
+
         guard tile.pid == front else { return }          // 点的是别的 app ⇒ 交给系统
         // 无窗口 ⇒ 保留原生「打开新窗口」；窗口已全部最小化 ⇒ 保留原生「点图标恢复」
         let stats = DockAX.windowStats(pid: tile.pid)
         guard stats.total > 0, stats.minimized < stats.total else { return }
         pending = (tile, p)
+    }
+
+    private func isLauncher(_ t: DockTile) -> Bool {
+        if let b = t.bundleID, kLauncherIDs.contains(b) { return true }
+        return kLauncherNames.contains(t.name)
     }
 
     private func onUp(_ p: CGPoint) {
@@ -384,6 +551,10 @@ final class ClickMonitor {
     }
 
     private func act(_ tile: DockTile) {
+        if isLauncher(tile) {
+            closeLauncher()
+            return
+        }
         guard let app = NSRunningApplication(processIdentifier: tile.pid) else { return }
         switch Prefs.mode {
         case .hide:
@@ -394,6 +565,46 @@ final class ClickMonitor {
             dlog("收起 \(tile.name)：\(r)")
         }
         TileCache.shared.refresh()
+    }
+
+    /// 关闭启动台：覆盖层是**程序坞进程自己画的**，没有独立 app 可关。
+    /// 所以给程序坞发 Esc（Docklet 自己的关闭路径），不行再发全局 Esc。
+    /// 关闭启动台：覆盖层是**程序坞进程自己画的**，没有独立 app 可关。
+    /// 顺序按「实测生效速度」排：全局 Esc（走正常事件流，最快）→ 程序坞 Esc + 通知（一起发）。
+    private func closeLauncher() {
+        let t0 = Date()
+        func ms() -> Int { Int(Date().timeIntervalSince(t0) * 1000) }
+
+        // ① 全局 Esc：覆盖层自己的监视器会收到，实测比 postToPid 快
+        postGlobalKey(code: 0x35)
+        usleep(120_000)
+        if !launcherOverlayOpen() {
+            dlog("关闭启动台：全局 Esc 生效（\(ms())ms）")
+            return
+        }
+
+        // ② 程序坞 Esc + Docklet 开关通知，一起发
+        if let dockPID = DockAX.dockPID() {
+            sendKey(pid: dockPID, code: 0x35)
+        }
+        DistributedNotificationCenter.default().postNotificationName(
+            NSNotification.Name("com.apple.launchpad.toggle"),
+            object: nil, userInfo: nil, deliverImmediately: true)
+        usleep(200_000)
+        if !launcherOverlayOpen() {
+            dlog("关闭启动台：程序坞 Esc / toggle 通知生效（\(ms())ms）")
+            return
+        }
+        dlog("关闭启动台：全部无效 overlayOpen=true（\(ms())ms）")
+    }
+
+    /// 全局按键（会同时送到前台 app，仅作兜底）
+    private func postGlobalKey(code: CGKeyCode) {
+        guard let src = CGEventSource(stateID: .hidSystemState),
+              let d = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: true),
+              let u = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: false) else { return }
+        d.post(tap: .cghidEventTap)
+        u.post(tap: .cghidEventTap)
     }
 
     /// 自测用：把「按下→抬起」整条判定链跑一遍（不依赖真实鼠标事件）
@@ -453,12 +664,16 @@ final class ClickMonitor {
     }
 
     /// 向指定进程发 ⌘M（app 自己的「窗口 › 最小化」菜单命令）
-    private func sendCmdM(pid: pid_t) {
+    private func sendCmdM(pid: pid_t) { sendKey(pid: pid, code: 0x2E, flags: .maskCommand) }
+
+    private func sendKey(pid: pid_t, code: CGKeyCode, flags: CGEventFlags = []) {
         guard let src = CGEventSource(stateID: .hidSystemState),
-              let down = CGEvent(keyboardEventSource: src, virtualKey: 0x2E, keyDown: true),
-              let up = CGEvent(keyboardEventSource: src, virtualKey: 0x2E, keyDown: false) else { return }
-        down.flags = .maskCommand
-        up.flags = .maskCommand
+              let down = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: true),
+              let up = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: false) else { return }
+        if !flags.isEmpty {
+            down.flags = flags
+            up.flags = flags
+        }
         down.postToPid(pid)
         up.postToPid(pid)
     }
@@ -468,6 +683,7 @@ final class ClickMonitor {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
+    private var permissionTimer: DispatchSourceTimer?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -483,6 +699,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let trusted = axTrusted(prompt: true)
         dlog("启动，AX 授权=\(trusted)")
         if trusted { _ = ClickMonitor.shared.start() }
+        startPermissionWatcher()
+
+        // 开机自启：默认开。每次启动对齐一次，app 被移动也能自愈
+        AutoStart.sync()
+        dlog("开机自启=\(Prefs.autoStart)，LaunchAgent 存在=\(AutoStart.installed)")
 
         // 启动后自检：把枚举到的 Dock 图标写进日志，便于排错
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
@@ -508,6 +729,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ note: Notification) {
         ClickMonitor.shared.stop()
+    }
+
+    /// 权限监视：`AXIsProcessTrusted` 的结果会被进程缓存，用户授权前启动的实例
+    /// 不会自己变可信。这里每 2 秒复查一次，一旦授权就自动把监听拉起来，省掉手动重启。
+    private func startPermissionWatcher() {
+        guard permissionTimer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 1.0, repeating: 2.0, leeway: .milliseconds(300))
+        t.setEventHandler {
+            guard Prefs.enabled, !ClickMonitor.shared.isRunning, axTrusted() else { return }
+            if ClickMonitor.shared.start() {
+                dlog("检测到授权已生效，监听自动启动")
+            }
+        }
+        t.resume()
+        permissionTimer = t
     }
 
     func menuWillOpen(_ menu: NSMenu) { rebuild() }
@@ -544,6 +781,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         enable.state = Prefs.enabled ? .on : .off
         menu.addItem(enable)
 
+        let auto = NSMenuItem(title: "开机自启", action: #selector(toggleAutoStart), keyEquivalent: "")
+        auto.target = self
+        auto.state = Prefs.autoStart ? .on : .off
+        menu.addItem(auto)
+
         let minimizeItem = NSMenuItem(title: "收起方式：最小化窗口（原生动画）", action: #selector(useMinimize), keyEquivalent: "")
         minimizeItem.target = self
         minimizeItem.state = Prefs.mode == .minimize ? .on : .off
@@ -577,6 +819,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleEnabled() {
         Prefs.enabled.toggle()
         if Prefs.enabled && axTrusted() { _ = ClickMonitor.shared.start() } else { ClickMonitor.shared.stop() }
+        rebuild()
+    }
+
+    @objc private func toggleAutoStart() {
+        Prefs.autoStart.toggle()
+        AutoStart.sync()
+        dlog("开机自启=\(Prefs.autoStart)，LaunchAgent 存在=\(AutoStart.installed)")
         rebuild()
     }
 
@@ -707,6 +956,15 @@ func runDiagnose() {
 
 if CommandLine.arguments.contains("--diagnose") {
     runDiagnose()
+    exit(0)
+}
+
+// 单实例：launchd 与手动 open 同时拉起时，只保留一个
+let siblings = NSRunningApplication
+    .runningApplications(withBundleIdentifier: "com.geekaudio.DockClickMin")
+    .filter { $0.processIdentifier != getpid() }
+if !siblings.isEmpty {
+    dlog("已有实例在运行（pid=\(siblings[0].processIdentifier)），本次退出")
     exit(0)
 }
 

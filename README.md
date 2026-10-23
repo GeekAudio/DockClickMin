@@ -58,7 +58,19 @@ cd DockClickMin
 
 授权后菜单栏出现 `dock.rectangle` 图标，菜单里状态显示「监听中 · N 个图标」。
 
-> ⚠️ **授权后必须重启进程**。`AXIsProcessTrusted` 的结果会被进程缓存，授权之前启动的实例不会自动变可信，事件监听也就不会建立。
+> 授权生效后**不需要手动重启**：程序每 2 秒复查一次权限，一旦通过就自动建立监听（`AXIsProcessTrusted` 的结果会被进程缓存，早期版本必须重启进程才认）。
+
+## 菜单
+
+| 项 | 作用 |
+|---|---|
+| 启用 | 总开关，关掉后事件监听停止 |
+| 开机自启 | 登录时自动启动，**默认开**（详见下文） |
+| 收起方式：最小化窗口（原生动画） | 按窗口黄色按钮 / ⌘M，genie 动画（**默认**） |
+| 收起方式：隐藏整个应用（瞬时，无动画） | `NSRunningApplication.hide()`，像 ⌘H |
+| 状态：监听中 · N 个图标 | 实时确认 AX 枚举是否正常 |
+| 打开日志 | `~/Library/Logs/DockClickMin.log` |
+| 退出 | 终止 |
 
 ## 收起方式
 
@@ -92,12 +104,21 @@ defaults write com.apple.dock mineffect -string genie && killall Dock
 
 窗口已全部最小化时，本工具**主动放行**（`stats.minimized == stats.total` 直接 return），于是系统原生的「点图标恢复所有窗口」照常工作。所以效果是：**点一下收起（带动画），再点一下还原（也带动画）** —— 正好是 Windows 任务栏的切换语义，还原那半是系统原生行为，零额外代码。
 
+## 启动台（Apps / Launchpad）
+
+macOS 26 Tahoe 把启动台换成了 `/System/Applications/Apps.app`（`com.apple.apps.launcher`，`LSUIElement`）。它不是普通 app —— 没有「最小化」语义，点图标应当是**关闭**它。
+
+所以这一格走单独分支：识别到启动台图标时，按顺序发 **Esc** → `hide()` → `terminate()`，直到进程真的退出。日志会记 `关闭 启动台：terminated=true`。
+
+注意：`open -b com.apple.apps.launcher` **打不开它**（只能由 Dock 图标唤起），所以这一条只能靠真实点击验证。
+
 ## 边界与已知行为
 
 | 场景 | 行为 | 原因 |
 |---|---|---|
 | 点**非**前台的 Dock 图标 | 正常切换，不收起 | 按下时的前台 pid ≠ 图标 pid |
 | 窗口已全部最小化时点图标 | **原生恢复所有窗口** | 主动放行，不抢系统行为 |
+| 点**启动台**图标且它正开着 | 关闭它（Esc → hide → terminate） | 启动器没有最小化语义 |
 | 按住 ⌘/⌥/⌃/⇧ 点 | 完全放行 | 保留 ⌥-click 隐藏其他等原生操作 |
 | 图标内按下后拖拽（≥8pt） | 不触发 | 防止拖拽排序图标时误收起 |
 | app 一个窗口都没有 | 放行，走原生「打开新窗口」 | 否则会把「重新打开窗口」吃掉 |
@@ -142,21 +163,24 @@ touch ~/Library/Logs/DockClickMin.selftest && open ./DockClickMin.app
 tail -30 ~/Library/Logs/DockClickMin.log
 ```
 
-## 开机自启（可选）
+## 开机自启（内置，默认开启）
+
+菜单栏 → **开机自启**，默认勾选。实现是写一个 LaunchAgent，登录时 launchd 自动加载，不需要 root，也不要求 app 装在 `/Applications`：
+
+```
+~/Library/LaunchAgents/com.geekaudio.DockClickMin.plist
+```
+
+每次启动都会按当前可执行文件路径重写这个 plist —— app 被移动、改名后能自愈，不会留下失效的路径。
+
+- 取消勾选 ⇒ `launchctl bootout` + 删除 plist
+- 单实例保护：launchd 与手动 `open` 同时拉起时只保留一个进程
+
+手动检查：
 
 ```bash
-mkdir -p ~/Library/LaunchAgents
-cat > ~/Library/LaunchAgents/com.geekaudio.DockClickMin.plist <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.geekaudio.DockClickMin</string>
-  <key>ProgramArguments</key>
-  <array><string>$HOME/Applications/DockClickMin.app/Contents/MacOS/DockClickMin</string></array>
-  <key>RunAtLoad</key><true/>
-</dict></plist>
-EOF
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.geekaudio.DockClickMin.plist
+plutil -p ~/Library/LaunchAgents/com.geekaudio.DockClickMin.plist
+launchctl list | grep DockClickMin
 ```
 
 ## 卸载
