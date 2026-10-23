@@ -420,6 +420,8 @@ final class ClickMonitor {
     private var source: CFRunLoopSource?
     private var pending: (tile: DockTile, down: CGPoint)?
     private var raisePending: pid_t?
+    /// 刚刚对它做过收起动作（最小化/隐藏）的时间戳：此期间不允许「提到最前」再把它拉回来
+    private var suppressRaiseUntil: Date = .distantPast
     private let work = DispatchQueue(label: "com.geekaudio.dockclickmin.work")
     private(set) var lastError: String?
 
@@ -577,8 +579,8 @@ final class ClickMonitor {
     private func onUp(_ p: CGPoint) {
         if let pid = raisePending {
             raisePending = nil
-            // 等 Dock 完成激活 / 恢复窗口，再把窗口提到最前
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.16) { [weak self] in
+            // 等 Dock 完成激活 / 恢复窗口，再把窗口提到最前（同一个串行队列，状态不打架）
+            work.asyncAfter(deadline: .now() + 0.16) { [weak self] in
                 self?.raiseApp(pid: pid)
             }
         }
@@ -591,7 +593,12 @@ final class ClickMonitor {
     /// 把应用的主窗口提到最前（AXRaise）。
     /// 只能越过同层级窗口；压不过别的应用设置的浮动层级窗口（例如 QQ 的置顶面板）。
     private func raiseApp(pid: pid_t) {
+        // 刚收起过它就别再拉回来，否则会出现「先置顶、再点一下才最小化」的错乱
+        if Date() < suppressRaiseUntil { return }
         guard let app = NSRunningApplication(processIdentifier: pid) else { return }
+        // 已经在前台且没有最小化窗口 ⇒ 原生行为已经够好，不必再动
+        let stats = DockAX.windowStats(pid: pid)
+        if app.isActive && stats.total > 0 && stats.minimized == 0 { return }
         if !app.isActive { app.activate(options: []) }
         guard let w = DockAX.windows(pid: pid).first else { return }
         var mini: CFTypeRef?
@@ -613,6 +620,8 @@ final class ClickMonitor {
             app.activate(options: [])
             usleep(70_000)
         }
+        // 一旦决定收起，就压住「提到最前」，避免延迟的 raise 又把它拉回来
+        suppressRaiseUntil = Date().addingTimeInterval(1.2)
 
         switch Prefs.mode {
         case .hide:
