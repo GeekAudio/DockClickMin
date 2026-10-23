@@ -72,11 +72,6 @@ enum Prefs {
         }
         set { UserDefaults.standard.set(newValue, forKey: "raiseOnSummon") }
     }
-    /// 取消 QQ 置顶（用 QQ 自己的菜单项），默认关
-    static var unpinQQ: Bool {
-        get { UserDefaults.standard.bool(forKey: "unpinQQ") }
-        set { UserDefaults.standard.set(newValue, forKey: "unpinQQ") }
-    }
     /// 保护名单：这些应用点图标时完全不收起（访达是系统外壳，收起后桌面和文件窗口全没了）
     /// 可自行追加，不必重新编译：
     ///   defaults write com.geekaudio.DockClickMin protectedApps -array com.apple.finder com.tencent.qq
@@ -479,215 +474,6 @@ func topmostNormalWindowPID() -> pid_t? {
 
 // MARK: - 取消 QQ 置顶
 
-/// QQ 主窗口是浮动层级（CGWindow layer=3），公开 API 改不了：
-/// `CGSSetWindowLevel` 虽然返回 success，但 QQ 会立刻把层级设回去（实测 0.7s 内弹回）。
-/// 所以只能走 QQ 自己的「置顶」菜单项 —— 那是 QQ 的内部状态，改了才持久。
-enum UnpinQQ {
-    static let bundleID = "com.tencent.qq"
-
-    struct Item {
-        let element: AXUIElement
-        let title: String
-        let checked: Bool
-    }
-
-    static func qqPID() -> pid_t? {
-        NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.processIdentifier
-    }
-
-    /// 遍历整个菜单树，收集所有 AXMenuItem
-    static func allMenuItems(pid: pid_t) -> [Item] {
-        let appEl = AXUIElementCreateApplication(pid)
-        var out: [Item] = []
-        walk(appEl, depth: 0, into: &out)
-        return out
-    }
-
-    private static func walk(_ el: AXUIElement, depth: Int, into out: inout [Item]) {
-        guard depth <= 6 else { return }
-        var roleRef: CFTypeRef?
-        AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef)
-        let role = roleRef as? String ?? ""
-
-        if role == (kAXMenuItemRole as String) {
-            var tRef: CFTypeRef?
-            AXUIElementCopyAttributeValue(el, kAXTitleAttribute as CFString, &tRef)
-            let title = tRef as? String ?? ""
-            var mRef: CFTypeRef?
-            AXUIElementCopyAttributeValue(el, kAXMenuItemMarkCharAttribute as CFString, &mRef)
-            let mark = mRef as? String ?? ""
-            if !title.isEmpty { out.append(Item(element: el, title: title, checked: !mark.isEmpty)) }
-        }
-
-        var kidsRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &kidsRef) == .success,
-              let kids = kidsRef as? [AXUIElement] else { return }
-        for k in kids { walk(k, depth: depth + 1, into: &out) }
-    }
-
-    /// 执行一次「取消置顶」，返回可读结果。
-    /// 菜单里没有「置顶」项（实测 100 个菜单项全无），所以主路径是**窗口 AX 树深度搜索**，
-    /// 按完用窗口层级自校验：方向反了就再按一次恢复，不会把没置顶的给打开。
-    static func unpin() -> String {
-        guard let pid = qqPID() else { return "QQ 没在运行" }
-        let before = qqWindowLayers(pid)
-        guard let top = before.max() else { return "QQ 没有可见窗口" }
-        if top == 0 { return "QQ 窗口层级本来就是 0（未置顶）" }
-
-        // ① 先找窗口里的按钮（标题栏的图钉/置顶）
-        if let btn = findPinButton(pid: pid) {
-            AXUIElementPerformAction(btn, kAXPressAction as CFString)
-            usleep(260_000)
-            let now = qqWindowLayers(pid).max() ?? 0
-            if now < top { return "已取消置顶（层级 \(top) → \(now)）" }
-            if now > top {
-                AXUIElementPerformAction(btn, kAXPressAction as CFString)   // 按反了，恢复
-                usleep(150_000)
-                return "按错了方向（置顶反而被打开），已按第二次恢复原状"
-            }
-            return "按了按钮但层级没变（\(top) → \(now)）"
-        }
-
-        // ② 退而求其次：菜单树
-        let items = allMenuItems(pid: pid)
-        if let it = items.first(where: { $0.title.contains("置顶") }) {
-            if it.checked {
-                AXUIElementPerformAction(it.element, kAXPressAction as CFString)
-                usleep(200_000)
-                let now = qqWindowLayers(pid).max() ?? 0
-                return now < top ? "已取消置顶（菜单项，层级 \(top) → \(now)）" : "已按菜单项但层级仍是 \(now)"
-            }
-            return "菜单项「\(it.title)」未勾选（当前未置顶）"
-        }
-
-        return "QQ 里找不到置顶按钮/菜单项（窗口 \(before.count) 个、菜单 \(items.count) 项）"
-    }
-
-    /// QQ 各窗口的当前层级
-    static func qqWindowLayers(_ pid: pid_t) -> [Int] {        let arr = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        return arr.compactMap { w in
-            guard (w[kCGWindowOwnerPID as String] as? pid_t) == pid,
-                  let layer = w[kCGWindowLayer as String] as? Int,
-                  layer > 0 else { return nil }
-            return layer
-        }
-    }
-
-    /// 在 QQ 的窗口 AX 树里找置顶按钮
-    static func findPinButton(pid: pid_t) -> AXUIElement? {
-        let keywords = ["置顶", "取消置顶", "窗口置顶", "浮于", "总在最前", "Always on Top", "Pin", "Float", "钉住"]
-        var out: [AXUIElement] = []
-        for w in DockAX.windows(pid: pid) {
-            walkDeep(w, depth: 0, keywords: keywords, into: &out)
-        }
-        // 标题栏右侧的按钮优先（置顶按钮通常在那儿）
-        if let first = out.first {
-            var posRef: CFTypeRef?
-            AXUIElementCopyAttributeValue(first, kAXPositionAttribute as CFString, &posRef)
-            if let b = posRef as? NSDictionary,
-               let p = CGRect(dictionaryRepresentation: b as CFDictionary) {
-                // 取最靠右的一个
-                var best = first, bestX = p.origin.x
-                for e in out.dropFirst() {
-                    var r: CFTypeRef?
-                    AXUIElementCopyAttributeValue(e, kAXPositionAttribute as CFString, &r)
-                    if let bb = r as? NSDictionary, let pp = CGRect(dictionaryRepresentation: bb as CFDictionary), pp.origin.x > bestX {
-                        best = e; bestX = pp.origin.x
-                    }
-                }
-                return best
-            }
-        }
-        return out.first
-    }
-
-    /// 供 dump 用：置顶按钮候选数量
-    static func countPinCandidates(pid: pid_t) -> Int {
-        let keywords = ["置顶", "取消置顶", "窗口置顶", "浮于", "总在最前", "Always on Top", "Pin", "Float", "钉住"]
-        var out: [AXUIElement] = []
-        for w in DockAX.windows(pid: pid) {
-            walkDeep(w, depth: 0, keywords: keywords, into: &out)
-        }
-        return out.count
-    }
-
-    /// 供 dump 用：主窗口的控件清单（Electron 的按钮常无名称，只能靠角色和位置认）
-    static func dumpWindowControls(pid: pid_t) -> [String] {
-        guard let w = DockAX.windows(pid: pid).first else { return ["（无窗口）"] }
-        var out: [String] = []
-        collectControls(w, depth: 0, into: &out)
-        return out.isEmpty ? ["（没遍历到控件）"] : out
-    }
-
-    private static func collectControls(_ el: AXUIElement, depth: Int, into out: inout [String]) {
-        guard depth <= 4 else { return }
-        var roleRef: CFTypeRef?
-        AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef)
-        let role = roleRef as? String ?? ""
-        if role == (kAXButtonRole as String) || role == (kAXImageRole as String) ||
-           role == (kAXGroupRole as String) || role == (kAXCheckBoxRole as String) {
-            var t: CFTypeRef?
-            var d: CFTypeRef?
-            AXUIElementCopyAttributeValue(el, kAXTitleAttribute as CFString, &t)
-            AXUIElementCopyAttributeValue(el, kAXDescriptionAttribute as CFString, &d)
-            var posRef: CFTypeRef?
-            var sizeRef: CFTypeRef?
-            AXUIElementCopyAttributeValue(el, kAXPositionAttribute as CFString, &posRef)
-            AXUIElementCopyAttributeValue(el, kAXSizeAttribute as CFString, &sizeRef)
-            let pos = (posRef as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
-            let size = (sizeRef as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
-            let where_ = pos.map { "\(Int($0.origin.x)),\(Int($0.origin.y)) \(Int(size?.width ?? 0))x\(Int(size?.height ?? 0))" } ?? "?"
-            out.append("\(role) 「\((t as? String) ?? "")」 desc=\"\((d as? String) ?? "")\" @ \(where_)")
-        }
-        var kidsRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &kidsRef) == .success,
-              let kids = kidsRef as? [AXUIElement] else { return }
-        for k in kids { collectControls(k, depth: depth + 1, into: &out) }
-    }
-
-    private static func walkDeep(_ el: AXUIElement, depth: Int, keywords: [String], into out: inout [AXUIElement]) {
-        guard depth <= 8 else { return }
-        var roleRef: CFTypeRef?
-        AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef)
-        let role = roleRef as? String ?? ""
-        if role == (kAXButtonRole as String) || role == (kAXCheckBoxRole as String) ||
-           role == (kAXMenuItemRole as String) || role == (kAXImageRole as String) {
-            var t: CFTypeRef?
-            var d: CFTypeRef?
-            AXUIElementCopyAttributeValue(el, kAXTitleAttribute as CFString, &t)
-            AXUIElementCopyAttributeValue(el, kAXDescriptionAttribute as CFString, &d)
-            let text = ((t as? String) ?? "") + " " + ((d as? String) ?? "")
-            if keywords.contains(where: { text.contains($0) }) { out.append(el) }
-        }
-        var kidsRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &kidsRef) == .success,
-              let kids = kidsRef as? [AXUIElement] else { return }
-        for k in kids { walkDeep(k, depth: depth + 1, keywords: keywords, into: &out) }
-    }
-
-    /// 兜底：直接把窗口层级改成 0（QQ 可能会覆盖回去，仅作诊断）
-    static func forceLevelZero() -> String {
-        typealias ConnFn = @convention(c) () -> UInt32
-        typealias SetFn = @convention(c) (UInt32, UInt32, Int32) -> Int32
-        guard let h = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW),
-              let c = dlsym(h, "CGSMainConnectionID"), let s = dlsym(h, "CGSSetWindowLevel") else {
-            return "SkyLight 符号缺失"
-        }
-        let conn = unsafeBitCast(c, to: ConnFn.self)()
-        let setLevel = unsafeBitCast(s, to: SetFn.self)
-        guard let pid = qqPID() else { return "QQ 没在运行" }
-        let arr = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        var n = 0
-        for w in arr {
-            guard (w[kCGWindowOwnerPID as String] as? pid_t) == pid,
-                  let num = w[kCGWindowNumber as String] as? Int,
-                  let layer = w[kCGWindowLayer as String] as? Int, layer != 0 else { continue }
-            _ = setLevel(conn, UInt32(num), 0)
-            n += 1
-        }
-        return n == 0 ? "QQ 窗口层级本来就是 0" : "已尝试改 \(n) 个窗口的层级（QQ 可能覆盖回去）"
-    }
-}
 
 // MARK: - 事件监听
 
@@ -929,10 +715,6 @@ final class ClickMonitor {
         }
         TileCache.shared.refresh()
 
-        // 开关打开时，每次操作 QQ 都顺手把置顶取消掉（QQ 会自己重新置顶，所以要常压）
-        if Prefs.unpinQQ, tile.bundleID == UnpinQQ.bundleID {
-            dlog("取消 QQ 置顶：\(UnpinQQ.unpin())")
-        }
     }
 
     /// 隐藏整个应用，四级回退（`hide()` 对 helper / Electron / Tauri 类 app 常直接返回 false）：
@@ -1210,15 +992,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         auto.state = Prefs.autoStart ? .on : .off
         menu.addItem(auto)
 
+        let qq = NSMenuItem(title: "关于 QQ 置顶…", action: #selector(explainQQPin), keyEquivalent: "")
+        qq.target = self
+        menu.addItem(qq)
+
         let raise = NSMenuItem(title: "唤出时提到最前", action: #selector(toggleRaise), keyEquivalent: "")
         raise.target = self
         raise.state = Prefs.raiseOnSummon ? .on : .off
         menu.addItem(raise)
 
-        let unpin = NSMenuItem(title: "取消 QQ 置顶", action: #selector(toggleUnpinQQ), keyEquivalent: "")
-        unpin.target = self
-        unpin.state = Prefs.unpinQQ ? .on : .off
-        menu.addItem(unpin)
 
         let minimizeItem = NSMenuItem(title: "收起方式：最小化窗口（原生动画）", action: #selector(useMinimize), keyEquivalent: "")
         minimizeItem.target = self
@@ -1266,18 +1048,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuild()
     }
 
-    @objc private func toggleRaise() {
-        Prefs.raiseOnSummon.toggle()
-        rebuild()
+    /// QQ 的置顶没有外部入口，这里如实说明，避免反复白试
+    @objc private func explainQQPin() {
+        let a = NSAlert()
+        a.messageText = "QQ 的置顶无法从外部取消"
+        a.informativeText = "实测三条路都走不通：\n\n"
+            + "1. QQ 菜单共 100 个菜单项，没有一个叫「置顶」\n"
+            + "2. QQ 窗口的辅助功能树只暴露 9 个元素，且全部没有名称、没有位置（Electron 不把内部按钮交给系统）\n"
+            + "3. CGSSetWindowLevel 能压窗口层级，但本机返回成功却无效（立即复查层级仍是 3）\n\n"
+            + "请在 QQ 里手动关闭：主面板标题栏的图钉按钮，或 设置 › 通用 › 窗口置顶。"
+        a.alertStyle = .informational
+        a.addButton(withTitle: "知道了")
+        a.runModal()
     }
 
-    @objc private func toggleUnpinQQ() {
-        Prefs.unpinQQ.toggle()
-        if Prefs.unpinQQ {
-            let r1 = UnpinQQ.unpin()
-            dlog("取消 QQ 置顶：\(r1)")
-            if r1.contains("没有") { dlog("兜底：\(UnpinQQ.forceLevelZero())") }
-        }
+    @objc private func toggleRaise() {
+        Prefs.raiseOnSummon.toggle()
         rebuild()
     }
 
@@ -1323,19 +1109,6 @@ func runDump() {
         dlog("\(app.localizedName ?? "?") pid=\(pid) 窗口=\(t) 已最小化=\(m) 前台=\(app.isActive)")
         if let menus = DockAX.menuBarTitles(pid: pid) {
             dlog("   菜单: \(menus.joined(separator: " | "))")
-        }
-        if app.bundleIdentifier == UnpinQQ.bundleID {
-            let items = UnpinQQ.allMenuItems(pid: pid)
-            let hit = items.filter { $0.title.contains("置顶") }
-                .map { "\($0.title)[\($0.checked ? "✓" : " ")]" }
-            dlog("   QQ 菜单项共 \(items.count) 个；置顶相关：\(hit.isEmpty ? "无" : hit.joined(separator: " , "))")
-        }
-        if app.bundleIdentifier == UnpinQQ.bundleID {
-            dlog("   QQ 窗口层级：\(UnpinQQ.qqWindowLayers(pid).map(String.init).joined(separator: ","))；置顶按钮候选 \(UnpinQQ.countPinCandidates(pid: pid)) 个")
-            dlog("   QQ 主窗口控件：")
-            for line in UnpinQQ.dumpWindowControls(pid: pid).prefix(40) {
-                dlog("     \(line)")
-            }
         }
         for (i, w) in wins.enumerated() {
             let title = DockAX.text(w, kAXTitleAttribute as String)
