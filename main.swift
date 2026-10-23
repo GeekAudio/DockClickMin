@@ -80,6 +80,14 @@ enum Prefs {
         let arr = UserDefaults.standard.stringArray(forKey: "protectedApps") ?? def
         return Set(arr)
     }
+    /// 温和名单：这些应用只用 ⌘M 收起，不按 AX 按钮、不置 AXMinimized。
+    /// 原因：实测 Electron 系应用（QQ）被外部置 AXMinimized 后会把自己窗口重新设成浮动层级，
+    /// 表现为「一直被置顶，别的程序盖不住」。默认含 QQ，可自行增删。
+    static var gentleApps: Set<String> {
+        let def = ["com.tencent.qq"]
+        let arr = UserDefaults.standard.stringArray(forKey: "gentleApps") ?? def
+        return Set(arr)
+    }
 }
 
 // MARK: - 开机自启（LaunchAgent，登录时 launchd 自动加载，无需 root）
@@ -826,6 +834,22 @@ final class ClickMonitor {
         guard total > 0 else { return "无窗口" }
         var report: [String] = []
 
+        // 温和模式：只用 ⌘M，不按 AX 按钮、不置 AXMinimized。
+        // 实测 Electron 系应用（QQ）被外部置 AXMinimized 后会把自己窗口重新设成浮动层级
+        // （表现为「被置顶，别的程序盖不住」）。⌘M 是 app 自己的菜单命令，不会误按到别的按钮。
+        let gentle = NSRunningApplication(processIdentifier: pid)?
+            .bundleIdentifier.map { Prefs.gentleApps.contains($0) } ?? false
+        if gentle {
+            for i in 1...3 {
+                sendCmdM(pid: pid)
+                usleep(140_000)
+                let (t, m) = DockAX.windowStats(pid: pid)
+                if m >= t { return "⌘M 温和模式 \(i) 次→\(m)/\(t)" }
+            }
+            let (t, m) = DockAX.windowStats(pid: pid)
+            return "⌘M 温和模式 3 次仍→\(m)/\(t)"
+        }
+
         // ① 按黄色按钮
         var pressed = 0
         for w in DockAX.windows(pid: pid) {
@@ -992,10 +1016,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         auto.state = Prefs.autoStart ? .on : .off
         menu.addItem(auto)
 
-        let qq = NSMenuItem(title: "关于 QQ 置顶…", action: #selector(explainQQPin), keyEquivalent: "")
-        qq.target = self
-        menu.addItem(qq)
-
         let raise = NSMenuItem(title: "唤出时提到最前", action: #selector(toggleRaise), keyEquivalent: "")
         raise.target = self
         raise.state = Prefs.raiseOnSummon ? .on : .off
@@ -1046,20 +1066,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         AutoStart.sync()
         dlog("开机自启=\(Prefs.autoStart)，LaunchAgent 存在=\(AutoStart.installed)")
         rebuild()
-    }
-
-    /// QQ 的置顶没有外部入口，这里如实说明，避免反复白试
-    @objc private func explainQQPin() {
-        let a = NSAlert()
-        a.messageText = "QQ 的置顶无法从外部取消"
-        a.informativeText = "实测三条路都走不通：\n\n"
-            + "1. QQ 菜单共 100 个菜单项，没有一个叫「置顶」\n"
-            + "2. QQ 窗口的辅助功能树只暴露 9 个元素，且全部没有名称、没有位置（Electron 不把内部按钮交给系统）\n"
-            + "3. CGSSetWindowLevel 能压窗口层级，但本机返回成功却无效（立即复查层级仍是 3）\n\n"
-            + "请在 QQ 里手动关闭：主面板标题栏的图钉按钮，或 设置 › 通用 › 窗口置顶。"
-        a.alertStyle = .informational
-        a.addButton(withTitle: "知道了")
-        a.runModal()
     }
 
     @objc private func toggleRaise() {

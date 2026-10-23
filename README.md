@@ -78,7 +78,6 @@ cd DockClickMin
 | 启用 | 总开关，关掉后事件监听停止 |
 | 开机自启 | 登录时自动启动，**默认开**（详见下文） |
 | 唤出时提到最前 | 点 Dock 图标唤出应用后，用 `AXRaise` 把它的主窗口提到最前，**默认开** |
-| 取消 QQ 置顶 | 用 QQ 自己的「置顶」菜单项把它关掉（`CGSSetWindowLevel` 会被 QQ 覆盖回去），**默认关** |
 | 收起方式：最小化窗口（原生动画） | 按窗口黄色按钮 / ⌘M，genie 动画（**默认**） |
 | 收起方式：隐藏整个应用（瞬时，无动画） | `NSRunningApplication.hide()`，像 ⌘H |
 | 状态：监听中 · N 个图标 | 实时确认 AX 枚举是否正常 |
@@ -174,6 +173,23 @@ defaults read com.geekaudio.DockClickMin protectedApps
 
 > 注意 `-array` 是**整体覆盖**，要把 `com.apple.finder` 一起写进去；想恢复默认就
 > `defaults delete com.geekaudio.DockClickMin protectedApps`。
+
+## 温和名单
+
+名单里的应用**只用 ⌘M 收起**，不按 AX 黄色按钮、也不直接置 `AXMinimized`。默认包含 QQ（`com.tencent.qq`）。
+
+原因：实测 Electron 系应用被外部置 `AXMinimized` 后，会把自己窗口重新设成浮动层级——表现为「一直被置顶，别的程序盖不住」。⌘M 是 app 自己的菜单命令，不存在误按到别的按钮的可能。
+
+```bash
+defaults read  com.geekaudio.DockClickMin gentleApps
+defaults write com.geekaudio.DockClickMin gentleApps -array com.tencent.qq   # 整体覆盖
+```
+
+某个应用还是被置顶，或者只想让它彻底不被收起：
+
+```bash
+defaults write com.geekaudio.DockClickMin protectedApps -array com.apple.finder com.tencent.qq
+```
 
 ## 重编译会掉授权
 
