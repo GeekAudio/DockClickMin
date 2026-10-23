@@ -106,6 +106,8 @@ cd DockClickMin
 | ② | `CGEvent.postToPid` 发 ⌘M | 走 app 自己的「窗口 › 最小化」菜单命令，也有动画 |
 | ③ | 直接置 `AXMinimized = true` | 最后兜底，无动画 |
 
+**窗口列表要过滤**：`kAXWindowsAttribute` 会混进非窗口元素 —— 访达会把桌面滚动区（`AXScrollArea`）也塞进窗口列表，它没有最小化按钮、永远收不起来。不过滤的话统计会卡在 `1/2`，还会反复重试。所以取窗口时按 `role == AXWindow` 过滤。
+
 **为什么需要三级**：AX 的 `.success` 只代表「消息投递成功」，不代表 app 照做。实测 **QQ 对 ① 返回 success 但窗口不动**。只写 ① 的话这类 app 点了没反应。日志会打印每级的实际效果：
 
 ```

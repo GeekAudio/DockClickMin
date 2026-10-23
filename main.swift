@@ -186,10 +186,8 @@ enum DockAX {
 
     /// (窗口总数, 已最小化数)
     static func windowStats(pid: pid_t) -> (total: Int, minimized: Int) {
-        let el = AXUIElementCreateApplication(pid)
-        var v: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(el, kAXWindowsAttribute as CFString, &v) == .success,
-              let wins = v as? [AXUIElement] else { return (0, 0) }
+        let wins = windows(pid: pid)          // 已过滤掉 AXScrollArea 之类的非窗口元素
+        guard !wins.isEmpty else { return (0, 0) }
         var mini = 0
         for w in wins {
             var cur: CFTypeRef?
@@ -213,21 +211,19 @@ enum DockAX {
 
     /// 还原所有窗口（自测后恢复桌面）
     static func restoreAll(pid: pid_t) {
-        let el = AXUIElementCreateApplication(pid)
-        var v: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(el, kAXWindowsAttribute as CFString, &v) == .success,
-              let wins = v as? [AXUIElement] else { return }
-        for w in wins {
+        for w in windows(pid: pid) {
             AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
         }
     }
 
+    /// 真正的窗口：`kAXWindowsAttribute` 会混进非窗口元素（访达把桌面滚动区
+    /// `AXScrollArea` 也塞进来，它没有最小化按钮、永远收不起来，会让统计卡在 1/2）
     static func windows(pid: pid_t) -> [AXUIElement] {
         let el = AXUIElementCreateApplication(pid)
         var v: CFTypeRef?
         guard AXUIElementCopyAttributeValue(el, kAXWindowsAttribute as CFString, &v) == .success,
               let wins = v as? [AXUIElement] else { return [] }
-        return wins
+        return wins.filter { (str($0, kAXRoleAttribute as String) ?? "") == (kAXWindowRole as String) }
     }
 
     static func isMinimized(_ w: AXUIElement) -> Bool {
