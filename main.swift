@@ -414,10 +414,46 @@ func dockWindows() -> [DockWindowInfo] {
 
 func dockWindowFrames() -> [CGRect] { dockWindows().map { $0.rect } }
 
+/// macOS 26 的启动台（Apps.app）界面实际由**聚焦 / Spotlight** 托管：
+/// 实测打开时 `owner=聚焦 pid=657 layer=23 rect=747,303 844x577`，
+/// 而旧版本（Tahoe 早期）是程序坞自己画的两个全屏窗口（layer 27/29）。
+/// 两条路径都认，否则层级一变就失效。
+let kLauncherHostIDs: Set<String> = ["com.apple.Spotlight"]
+
 /// 启动台开着时，程序坞会多出全屏覆盖层窗口，layer 从 20 升到 27/29。
 /// 关闭时只有 layer=20 那一个。实测依据见 README。
 func launcherOverlayOpen() -> Bool {
-    dockWindows().contains { $0.layer >= 26 }
+    if dockWindows().contains(where: { $0.layer >= 26 }) { return true }
+    return launcherHostHasWindow()
+}
+
+/// 启动台的宿主进程（聚焦）当前有没有可见窗口
+func launcherHostHasWindow() -> Bool {
+    let pids = Set(kLauncherHostIDs.flatMap {
+        NSRunningApplication.runningApplications(withBundleIdentifier: $0).map { $0.processIdentifier }
+    })
+    guard !pids.isEmpty else { return false }
+    let arr = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+    for w in arr {
+        guard let pid = w[kCGWindowOwnerPID as String] as? pid_t, pids.contains(pid) else { continue }
+        let alpha = w[kCGWindowAlpha as String] as? Double ?? 1
+        if alpha <= 0.01 { continue }
+        guard let b = w[kCGWindowBounds as String] as? NSDictionary,
+              let r = CGRect(dictionaryRepresentation: b as CFDictionary),
+              r.width >= 300, r.height >= 200 else { continue }
+        return true
+    }
+    return false
+}
+
+/// 启动台宿主进程的 pid（关闭时要发 Esc 给它）
+func launcherHostPID() -> pid_t? {
+    for b in kLauncherHostIDs {
+        if let app = NSRunningApplication.runningApplications(withBundleIdentifier: b).first {
+            return app.processIdentifier
+        }
+    }
+    return nil
 }
 
 /// 屏幕窗口栈里最上层的「普通窗口」（layer 0）属于谁。
@@ -808,15 +844,12 @@ final class ClickMonitor {
         return false
     }
 
-    /// 关闭启动台：覆盖层是**程序坞进程自己画的**，没有独立 app 可关。
-    /// 所以给程序坞发 Esc（Docklet 自己的关闭路径），不行再发全局 Esc。
-    /// 关闭启动台：覆盖层是**程序坞进程自己画的**，没有独立 app 可关。
-    /// 顺序按「实测生效速度」排：全局 Esc（走正常事件流，最快）→ 程序坞 Esc + 通知（一起发）。
+    /// 关闭启动台：界面由**聚焦（Spotlight）**托管，旧版由程序坞自己画，两边都发 Esc。
     private func closeLauncher() {
         let t0 = Date()
         func ms() -> Int { Int(Date().timeIntervalSince(t0) * 1000) }
 
-        // ① 全局 Esc：覆盖层自己的监视器会收到，实测比 postToPid 快
+        // ① 全局 Esc：走正常事件流，最快
         postGlobalKey(code: 0x35)
         usleep(120_000)
         if !launcherOverlayOpen() {
@@ -824,19 +857,25 @@ final class ClickMonitor {
             return
         }
 
-        // ② 程序坞 Esc + Docklet 开关通知，一起发
+        // ② 宿主（聚焦）+ 程序坞 Esc，一起发
+        if let host = launcherHostPID() {
+            sendKey(pid: host, code: 0x35)
+        }
         if let dockPID = DockAX.dockPID() {
             sendKey(pid: dockPID, code: 0x35)
         }
+        usleep(200_000)
+        if !launcherOverlayOpen() {
+            dlog("关闭启动台：聚焦/程序坞 Esc 生效（\(ms())ms）")
+            return
+        }
+
+        // ③ Docklet 开关通知
         DistributedNotificationCenter.default().postNotificationName(
             NSNotification.Name("com.apple.launchpad.toggle"),
             object: nil, userInfo: nil, deliverImmediately: true)
         usleep(200_000)
-        if !launcherOverlayOpen() {
-            dlog("关闭启动台：程序坞 Esc / toggle 通知生效（\(ms())ms）")
-            return
-        }
-        dlog("关闭启动台：全部无效 overlayOpen=true（\(ms())ms）")
+        dlog("关闭启动台：全部无效 overlayOpen=\(launcherOverlayOpen())（\(ms())ms）")
     }
 
     /// 全局按键（走正常事件流，前台 app 收到；仅用于「前台 app 自己」的菜单命令）
@@ -1004,7 +1043,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let running = ClickMonitor.shared.isRunning
 
-        if !trusted {
+        // 顶部提示：**未开启时不说权限**，只说已停用 —— 否则用户手动关掉开关
+        // 却看到满屏「未授权」，会以为出故障了
+        if !Prefs.enabled {
+            let it = NSMenuItem(title: "已停用（勾选「启用」恢复）", action: nil, keyEquivalent: "")
+            it.isEnabled = false
+            menu.addItem(it)
+        } else if !trusted {
             let it = NSMenuItem(title: "⚠︎ 未授权：点这里开启「辅助功能」",
                                 action: #selector(openAXSettings), keyEquivalent: "")
             it.target = self
@@ -1054,9 +1099,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         let detail = "\(TileCache.shared.tiles.count) 个图标"
-        let state = NSMenuItem(title: "状态：" + (trusted ? (running ? "监听中 · " + detail : "已授权，未监听")
-                                                        : "缺权限"),
-                              action: nil, keyEquivalent: "")
+        let stateText: String
+        if !Prefs.enabled      { stateText = "已停用" }
+        else if !trusted       { stateText = "缺权限（勾选「启用」后会提示授权）" }
+        else if running        { stateText = "监听中 · " + detail }
+        else                   { stateText = "已授权，未监听" }
+        let state = NSMenuItem(title: "状态：" + stateText, action: nil, keyEquivalent: "")
         state.isEnabled = false
         menu.addItem(state)
 
