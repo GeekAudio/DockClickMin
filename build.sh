@@ -17,6 +17,13 @@ mkdir -p "$STAGE/$APP.app/Contents/Resources"
 cp Info.plist "$STAGE/$APP.app/Contents/Info.plist"
 printf 'APPL????' > "$STAGE/$APP.app/Contents/PkgInfo"
 
+if [ -f assets/AppIcon.icns ]; then
+    cp assets/AppIcon.icns "$STAGE/$APP.app/Contents/Resources/AppIcon.icns"
+    echo "==> 图标已打包"
+else
+    echo "!! 缺少 assets/AppIcon.icns（可用 assets/make_icon.swift 重新生成）"
+fi
+
 echo "==> 编译 x86_64"
 swiftc -O -swift-version 5 -target "x86_64-apple-macos${SDK_TARGET_MIN}" \
     -o "$STAGE/x86_64" main.swift \

@@ -1,5 +1,7 @@
 # DockClickMin
 
+<img src="assets/icon-1024.png" width="120" align="right">
+
 > 点 Dock 图标 = 收起前台应用（Windows 任务栏语义），macOS 原生实现。
 > Click a Dock icon to collapse the frontmost app — pure Cocoa / Accessibility / CGEventTap, no third-party dependency.
 
