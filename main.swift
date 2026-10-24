@@ -4,7 +4,7 @@
 //
 //  原理（纯系统 API，无第三方依赖）：
 //   1. AXUIElement 读 Dock 进程的辅助功能树 → 每个应用图标的实时矩形 + bundle id
-//   2. CGEventTap（listen-only，只监听不拦截，绝不改写你的输入）看左键按下/抬起
+//   2. CGEventTap 看左键按下/抬起；普通应用原样放行，仅关闭启动台时拦截点击
 //   3. 按下时记住「当时的前台 app」；抬起时若落点仍在同一个图标内、且该 app 就是
 //      按下时的前台 app ⇒ 这是「再次点击已在前台的图标」⇒ 收起它
 //
@@ -39,11 +39,6 @@ func dlog(_ s: String) {
 
 // MARK: - 设置
 
-enum CollapseMode: String {
-    case hide       // 整个 app 收起（最接近 Windows 任务栏）
-    case minimize   // 只把窗口最小化进 Dock 图标
-}
-
 enum Prefs {
     static var mode: CollapseMode {
         get { CollapseMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .minimize }
@@ -72,31 +67,51 @@ enum Prefs {
         }
         set { UserDefaults.standard.set(newValue, forKey: "raiseOnSummon") }
     }
-    /// 保护名单：这些应用点图标时完全不收起。
-    /// 默认含访达（系统外壳）和 QQ —— **QQ 只要被最小化再恢复，就会把自己窗口设成浮动层级**
-    /// （实测：手动点黄色按钮最小化再恢复也照样置顶，是 QQ 自身行为，与工具无关），
-    /// 所以默认不碰它，避免替用户触发这个副作用。
-    /// 可自行增删，不必重新编译：
-    ///   defaults write com.geekaudio.DockClickMin protectedApps -array com.apple.finder
+    /// 用户可选的排除名单；默认所有应用都参与收起/恢复。
     static var protectedApps: Set<String> {
-        let def = ["com.apple.finder", "com.tencent.qq"]
-        let arr = UserDefaults.standard.stringArray(forKey: "protectedApps") ?? def
-        return Set(arr)
+        WindowPolicy.protectedApps(configured: UserDefaults.standard.stringArray(forKey: "protectedApps"))
+    }
+    static func isProtected(bundleID: String?) -> Bool {
+        bundleID.map { protectedApps.contains($0) } ?? false
+    }
+    static func isProtected(pid: pid_t) -> Bool {
+        isProtected(bundleID: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier)
+    }
+    static var nativeHideApps: Set<String> {
+        WindowPolicy.nativeHideApps(configured: UserDefaults.standard.stringArray(forKey: "nativeHideApps"))
+    }
+    static func usesNativeHide(pid: pid_t) -> Bool {
+        NSRunningApplication(processIdentifier: pid)?.bundleIdentifier.map { nativeHideApps.contains($0) } ?? false
+    }
+    static var nativeMinimizeApps: Set<String> {
+        WindowPolicy.nativeMinimizeApps(configured: UserDefaults.standard.stringArray(forKey: "nativeMinimizeApps"))
+    }
+    static func usesNativeMinimize(pid: pid_t) -> Bool {
+        NSRunningApplication(processIdentifier: pid)?.bundleIdentifier.map { nativeMinimizeApps.contains($0) } ?? false
+    }
+    static func usesNativeWindowActions(pid: pid_t) -> Bool {
+        usesNativeHide(pid: pid) || usesNativeMinimize(pid: pid)
+    }
+    static func effectiveMode(bundleID: String?) -> CollapseMode {
+        WindowPolicy.effectiveMode(bundleID: bundleID, requested: mode, nativeHideApps: nativeHideApps)
+    }
+    static func migrateCompatibility() {
+        let defaults = UserDefaults.standard
+        guard defaults.integer(forKey: "compatibilityPolicyVersion") < 3 else { return }
+        let old = defaults.stringArray(forKey: "protectedApps")
+        defaults.set(WindowPolicy.migratedProtectedApps(old), forKey: "protectedApps")
+        defaults.removeObject(forKey: "axRestoreApps")
+        defaults.removeObject(forKey: "unpinQQ")
+        let hideApps = defaults.stringArray(forKey: "nativeHideApps") ?? []
+        defaults.set(hideApps.filter { $0 != "com.tencent.qq" }, forKey: "nativeHideApps")
+        defaults.set(3, forKey: "compatibilityPolicyVersion")
+        dlog("兼容策略已更新：QQ 使用原生最小化命令，保留系统动画与 Dock 原生恢复")
     }
     /// 温和名单：这些应用只用 ⌘M 收起，不按 AX 按钮、不置 AXMinimized。
-    /// 原因：实测 Electron 系应用（QQ）被外部置 AXMinimized 后会把自己窗口重新设成浮动层级，
-    /// 表现为「一直被置顶，别的程序盖不住」。默认含 QQ，可自行增删。
+    /// QQ 固定使用原生最小化命令；其他应用可自行添加。
     static var gentleApps: Set<String> {
-        let def = ["com.tencent.qq"]
-        let arr = UserDefaults.standard.stringArray(forKey: "gentleApps") ?? def
-        return Set(arr)
-    }
-    /// 这些应用「从最小化恢复」时走 AX 恢复，不让 Dock 参与。
-    /// 用来验证 QQ 的置顶是不是 Dock 恢复路径触发的。默认含 QQ，可自行增删。
-    static var axRestoreApps: Set<String> {
-        let def = ["com.tencent.qq"]
-        let arr = UserDefaults.standard.stringArray(forKey: "axRestoreApps") ?? def
-        return Set(arr)
+        let arr = UserDefaults.standard.stringArray(forKey: "gentleApps") ?? []
+        return Set(arr).union(nativeMinimizeApps)
     }
 }
 
@@ -224,6 +239,11 @@ enum DockAX {
 
     /// 还原所有窗口（自测后恢复桌面）
     static func restoreAll(pid: pid_t) {
+        guard !Prefs.isProtected(pid: pid), !Prefs.usesNativeHide(pid: pid) else { return }
+        if Prefs.usesNativeMinimize(pid: pid) {
+            _ = pressDockIcon(pid: pid)
+            return
+        }
         for w in windows(pid: pid) {
             AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
         }
@@ -270,6 +290,47 @@ enum DockAX {
         guard AXUIElementCopyAttributeValue(bar, kAXChildrenAttribute as CFString, &v) == .success,
               let items = v as? [AXUIElement] else { return nil }
         return items.compactMap { str($0, kAXTitleAttribute as String) }.filter { !$0.isEmpty }
+    }
+
+    /// 调用应用自己的菜单命令，不直接设置 AXHidden/AXMinimized。
+    static func pressCommandMenu(pid: pid_t, character: String) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        var barRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXMenuBarAttribute as CFString, &barRef) == .success,
+              let barRef = barRef, CFGetTypeID(barRef) == AXUIElementGetTypeID() else { return false }
+        func find(_ el: AXUIElement, depth: Int) -> AXUIElement? {
+            guard depth <= 3 else { return nil }
+            if str(el, kAXRoleAttribute as String) == (kAXMenuItemRole as String),
+               str(el, kAXMenuItemCmdCharAttribute as String)?.lowercased() == character.lowercased() {
+                var modifiers: CFTypeRef?
+                var enabled: CFTypeRef?
+                AXUIElementCopyAttributeValue(el, kAXMenuItemCmdModifiersAttribute as CFString, &modifiers)
+                AXUIElementCopyAttributeValue(el, kAXEnabledAttribute as CFString, &enabled)
+                if (modifiers as? NSNumber)?.intValue == 0, (enabled as? Bool) != false { return el }
+            }
+            for child in children(el) ?? [] {
+                if let item = find(child, depth: depth + 1) { return item }
+            }
+            return nil
+        }
+        guard let item = find(unsafeBitCast(barRef, to: AXUIElement.self), depth: 0) else { return false }
+        return AXUIElementPerformAction(item, kAXPressAction as CFString) == .success
+    }
+
+    /// 让 Dock 自己恢复应用，避免写入目标窗口的 AXMinimized。
+    static func pressDockIcon(pid: pid_t) -> Bool {
+        guard let app = NSRunningApplication(processIdentifier: pid), let bid = app.bundleIdentifier,
+              let dock = dockPID() else { return false }
+        func find(_ el: AXUIElement, depth: Int) -> AXUIElement? {
+            guard depth <= 5 else { return nil }
+            if bundleID(el) == bid { return el }
+            for child in children(el) ?? [] {
+                if let item = find(child, depth: depth + 1) { return item }
+            }
+            return nil
+        }
+        guard let tile = find(AXUIElementCreateApplication(dock), depth: 0) else { return false }
+        return AXUIElementPerformAction(tile, kAXPressAction as CFString) == .success
     }
 
     private static func collect(_ el: AXUIElement, depth: Int, into out: inout [DockTile]) {
@@ -490,8 +551,17 @@ func topmostNormalWindowPID() -> pid_t? {
     return nil
 }
 
-// MARK: - 取消 QQ 置顶
-
+func hasVisibleAppWindow(pid: pid_t) -> Bool {
+    let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+        as? [[String: Any]] ?? []
+    return list.contains { w in
+        guard (w[kCGWindowOwnerPID as String] as? pid_t) == pid,
+              (w[kCGWindowAlpha as String] as? Double ?? 1) > 0.01,
+              let bounds = w[kCGWindowBounds as String] as? NSDictionary,
+              let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return false }
+        return rect.width > 40 && rect.height > 40
+    }
+}
 
 // MARK: - 事件监听
 
@@ -502,6 +572,7 @@ final class ClickMonitor {
     private var source: CFRunLoopSource?
     private var pending: (tile: DockTile, down: CGPoint)?
     private var raisePending: pid_t?
+    private var clickSequence = 0
     /// 刚刚对它做过收起动作（最小化/隐藏）的时间戳：此期间不允许「提到最前」再把它拉回来
     private var suppressRaiseUntil: Date = .distantPast
     private let work = DispatchQueue(label: "com.geekaudio.dockclickmin.work")
@@ -544,13 +615,13 @@ final class ClickMonitor {
         if let s = source { CFRunLoopRemoveSource(CFRunLoopGetMain(), s, .commonModes) }
         tap = nil
         source = nil
+        swallowUp = false
+        work.async { self.clearClick() }
         TileCache.shared.stop()
         dlog("事件监听已停止")
     }
 
     private var swallowUp = false
-    /// 非 nil 表示「这次抬起要改走 AX 恢复」——用来绕开 Dock 的恢复路径
-    private var axRestorePID: pid_t?
 
     /// 返回 nil = 吞掉这次事件；返回 event = 原样放行
     fileprivate func handle(type: CGEventType, event: CGEvent) -> CGEvent? {
@@ -564,7 +635,7 @@ final class ClickMonitor {
         // 带修饰键时完全放行：保留 ⌥-click「隐藏其他」、⌘-click 等原生行为
         let mods: CGEventFlags = [.maskCommand, .maskAlternate, .maskControl, .maskShift]
         if !event.flags.intersection(mods).isEmpty {
-            work.async { self.pending = nil }
+            work.async { self.clearClick() }
             return event
         }
 
@@ -575,29 +646,16 @@ final class ClickMonitor {
             // 让程序坞完全不处理它，同时立刻发 Esc —— 这样没有「关掉又被点开」的竞争。
             if let t = TileCache.shared.tiles.first(where: { $0.rect.contains(loc) }),
                isLauncher(t), launcherOverlayOpen() {
+                work.async { self.clearClick() }
                 swallowUp = true
                 closeLauncherFast()
                 return nil
             }
-            // 实验路径：名单内应用（默认 QQ）已全部最小化时，抬起改走 AX 恢复，
-            // 不让 Dock 执行它自己的恢复 —— 用来看置顶是不是 Dock 恢复路径触发的
-            if let t = TileCache.shared.tiles.first(where: { $0.rect.contains(loc) }),
-               let bid = t.bundleID, Prefs.axRestoreApps.contains(bid), t.pid > 0 {
-                let st = DockAX.windowStats(pid: t.pid)
-                if st.total > 0, st.minimized >= st.total {
-                    axRestorePID = t.pid
-                    dlog("\(t.name) 已最小化 → 抬起时改用 AX 恢复（绕开 Dock）")
-                }
-            }
             let front = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
-            work.async { self.onDown(loc, front) }
+            let target = TileCache.shared.tiles.first(where: { $0.rect.contains(loc) })
+            let wasHidden = target.flatMap { NSRunningApplication(processIdentifier: $0.pid) }?.isHidden ?? false
+            work.async { self.onDown(loc, front, wasHidden: wasHidden) }
         case .leftMouseUp:
-            if let pid = axRestorePID {
-                axRestorePID = nil
-                swallowUp = false
-                work.async { self.axRestore(pid) }
-                return nil                      // 吞掉，Dock 就不执行它的恢复
-            }
             if swallowUp {
                 swallowUp = false
                 return nil
@@ -640,9 +698,15 @@ final class ClickMonitor {
 
     private var downSeen = 0
 
-    private func onDown(_ p: CGPoint, _ front: pid_t) {
-        downSeen += 1
+    private func clearClick() {
         pending = nil
+        raisePending = nil
+        clickSequence += 1
+    }
+
+    private func onDown(_ p: CGPoint, _ front: pid_t, wasHidden: Bool = false) {
+        downSeen += 1
+        clearClick()
         let band = TileCache.shared.band
         let inBand = !band.isNull && band.contains(p)
         let tiles = DockAX.tiles()
@@ -667,24 +731,24 @@ final class ClickMonitor {
             return
         }
 
-        // 保护名单（默认含访达）：完全放行，交给系统原生行为
-        if let bid = tile.bundleID, Prefs.protectedApps.contains(bid) {
+        // 仅用户主动排除的应用不参与；默认支持全部应用。
+        if Prefs.isProtected(bundleID: tile.bundleID) || Prefs.isProtected(pid: tile.pid) {
             dlog("跳过 \(tile.name)（保护名单）")
             return
         }
 
-        // 点的是别的应用 ⇒ 交给系统切换，但抬起后把它的窗口提到最前
-        // 例外：它的窗口已经在窗口栈最上层（只是不是"活跃应用"）时，直接收起，一步到位
-        let topPID = topmostNormalWindowPID()
-        if tile.pid != front && tile.pid != topPID {
-            if Prefs.raiseOnSummon { raisePending = tile.pid }
+        // 必须使用按下瞬间的前台状态；异步看窗口栈会把刚恢复的窗口再次收起。
+        if tile.pid != front || wasHidden {
+            if Prefs.raiseOnSummon, !Prefs.usesNativeWindowActions(pid: tile.pid) { raisePending = tile.pid }
             return
         }
 
         // 无窗口 / 窗口已全部最小化 ⇒ 系统会自己「打开新窗口 / 恢复所有窗口」，之后也提一下
         let stats = DockAX.windowStats(pid: tile.pid)
-        guard stats.total > 0, stats.minimized < stats.total else {
-            if Prefs.raiseOnSummon { raisePending = tile.pid }
+        guard WindowPolicy.shouldCollapse(isFrontAtMouseDown: tile.pid == front, wasHidden: wasHidden,
+                                          windowCount: stats.total, minimizedCount: stats.minimized,
+                                          hasVisibleWindow: hasVisibleAppWindow(pid: tile.pid)) else {
+            if Prefs.raiseOnSummon, !Prefs.usesNativeWindowActions(pid: tile.pid) { raisePending = tile.pid }
             return
         }
         pending = (tile, p)
@@ -698,9 +762,11 @@ final class ClickMonitor {
     private func onUp(_ p: CGPoint) {
         if let pid = raisePending {
             raisePending = nil
+            let sequence = clickSequence
             // 等 Dock 完成激活 / 恢复窗口，再把窗口提到最前（同一个串行队列，状态不打架）
             work.asyncAfter(deadline: .now() + 0.16) { [weak self] in
-                self?.raiseApp(pid: pid)
+                guard let self = self, self.clickSequence == sequence else { return }
+                self.raiseApp(pid: pid)
             }
         }
         guard let (tile, down) = pending else { return }
@@ -710,21 +776,10 @@ final class ClickMonitor {
     }
 
     /// 把应用的主窗口提到最前（AXRaise）。
-    /// 只能越过同层级窗口；压不过别的应用设置的浮动层级窗口（例如 QQ 的置顶面板）。
-    /// 用 AX 直接恢复（不让 Dock 参与），用于验证置顶是不是 Dock 恢复路径触发的
-    private func axRestore(_ pid: pid_t) {
-        let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "?"
-        DockAX.restoreAll(pid: pid)
-        usleep(150_000)
-        if let app = NSRunningApplication(processIdentifier: pid) {
-            app.activate(options: [])
-        }
-        usleep(250_000)
-        let st = DockAX.windowStats(pid: pid)
-        dlog("AX 恢复 \(name)：\(st.minimized)/\(st.total) 已恢复")
-    }
-
+    /// 只能越过同层级窗口；受保护的应用不执行此动作。
     private func raiseApp(pid: pid_t) {
+        guard Prefs.enabled, Prefs.raiseOnSummon, !Prefs.isProtected(pid: pid),
+              !Prefs.usesNativeWindowActions(pid: pid) else { return }
         // 刚收起过它就别再拉回来，否则会出现「先置顶、再点一下才最小化」的错乱
         if Date() < suppressRaiseUntil { return }
         guard let app = NSRunningApplication(processIdentifier: pid) else { return }
@@ -744,68 +799,73 @@ final class ClickMonitor {
             closeLauncher()
             return
         }
+        guard Prefs.enabled, !Prefs.isProtected(bundleID: tile.bundleID),
+              !Prefs.isProtected(pid: tile.pid) else { return }
         guard let app = NSRunningApplication(processIdentifier: tile.pid) else { return }
 
-        // 先确保它真的成为前台：AX 动作只对 key window 生效，而我们的动作在 mouseUp 后
-        // 十几毫秒就跑了，可能早于系统完成激活（Clash Verge 这类 app 因此时灵时不灵）
-        if !app.isActive {
-            app.activate(options: [])
-            usleep(70_000)
-        }
+        // 用户已经切走时取消旧点击，避免后台队列重新抢焦点。
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == tile.pid, !app.isHidden else { return }
         // 一旦决定收起，就压住「提到最前」，避免延迟的 raise 又把它拉回来
         suppressRaiseUntil = Date().addingTimeInterval(1.2)
 
-        switch Prefs.mode {
+        switch Prefs.effectiveMode(bundleID: app.bundleIdentifier) {
         case .hide:
             dlog("收起 \(tile.name)：\(hideApp(pid: tile.pid))")
         case .minimize:
             let r = minimizeAll(pid: tile.pid)
-            dlog("收起 \(tile.name)：\(r)")
+            let stats = DockAX.windowStats(pid: tile.pid)
+            if stats.total > 0, stats.minimized == stats.total {
+                dlog("收起 \(tile.name)：\(r)")
+            } else if Prefs.usesNativeMinimize(pid: tile.pid) {
+                dlog("收起 \(tile.name)：\(r) / 保留原生最小化方式，未改用无动画隐藏")
+            } else {
+                dlog("收起 \(tile.name)：\(r) / 最小化未完成，改用隐藏：\(hideApp(pid: tile.pid, allowMinimizeFallback: false))")
+            }
         }
         TileCache.shared.refresh()
 
     }
 
-    /// 隐藏整个应用，四级回退（`hide()` 对 helper / Electron / Tauri 类 app 常直接返回 false）：
-    ///   ① NSRunningApplication.hide()
-    ///   ② 全局 ⌘H —— 走正常键盘事件流，前台 app 必收（Tauri 类不认 postToPid）
-    ///   ③ ⌘H → postToPid
-    ///   ④ AXHidden（放最后：部分 app 被置位后会自己弹回来，表现为「闪一下」）
-    ///   ⑤ 全失败则降级为最小化，至少把窗口收走
-    private func hideApp(pid: pid_t) -> String {
-        guard let app = NSRunningApplication(processIdentifier: pid) else { return "无进程" }
-        if app.hide() { return "hide() 成功" }
-
-        var report = ["hide()=false"]
-        let el = AXUIElementCreateApplication(pid)
-
-        postGlobalKey(code: 0x04, flags: .maskCommand)
-        usleep(120_000)
-        if isHidden(el, app) { return report.joined(separator: " / ") + " / 全局⌘H 成功" }
-        report.append("全局⌘H 无效")
-
-        sendKey(pid: pid, code: 0x04, flags: .maskCommand)
-        usleep(110_000)
-        if isHidden(el, app) { return report.joined(separator: " / ") + " / ⌘H→pid 成功" }
-        report.append("⌘H→pid 无效")
-
-        if AXUIElementSetAttributeValue(el, kAXHiddenAttribute as CFString, kCFBooleanTrue) == .success {
-            usleep(90_000)
-            if isHidden(el, app) { return report.joined(separator: " / ") + " / AXHidden 成功" }
-        }
-        report.append("AXHidden 无效")
-
-        let m = minimizeAll(pid: pid)
-        report.append("降级最小化：\(m)")
-        return report.joined(separator: " / ")
+    /// 等待真实隐藏状态；hide() 返回 false 也可能已经异步成功。
+    private func waitUntilHidden(pid: pid_t, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            if NSRunningApplication(processIdentifier: pid)?.isHidden == true { return true }
+            usleep(40_000)
+        } while Date() < deadline
+        return NSRunningApplication(processIdentifier: pid)?.isHidden == true
     }
 
-    private func isHidden(_ el: AXUIElement, _ app: NSRunningApplication) -> Bool {
-        if app.isHidden { return true }
-        var v: CFTypeRef?
-        if AXUIElementCopyAttributeValue(el, kAXHiddenAttribute as CFString, &v) == .success,
-           let b = v as? Bool { return b }
-        return false
+    /// 原生隐藏 → 原生菜单 → 定向 ⌘H，每一级等待实际效果后才回退。
+    /// 原生命令兼容应用不使用 AXHidden/AXMinimized，也不发送全局快捷键。
+    private func hideApp(pid: pid_t, allowMinimizeFallback: Bool = true) -> String {
+        guard !Prefs.isProtected(pid: pid) else { return "保护名单，跳过" }
+        guard let app = NSRunningApplication(processIdentifier: pid) else { return "无进程" }
+        if app.isHidden { return "已隐藏" }
+        let nativeOnly = Prefs.usesNativeWindowActions(pid: pid)
+        let request = app.hide()
+        if waitUntilHidden(pid: pid, timeout: 0.8) { return "原生隐藏已确认（hide()=\(request)）" }
+        var report = ["hide()=\(request)，未确认隐藏"]
+
+        if DockAX.pressCommandMenu(pid: pid, character: "h"), waitUntilHidden(pid: pid, timeout: 0.5) {
+            return report.joined(separator: " / ") + " / 原生隐藏菜单成功"
+        }
+        report.append("隐藏菜单未生效")
+
+        sendKey(pid: pid, code: 0x04, flags: .maskCommand)
+        if waitUntilHidden(pid: pid, timeout: 0.5) { return report.joined(separator: " / ") + " / ⌘H→pid 成功" }
+        report.append("⌘H→pid 无效")
+
+        if !nativeOnly, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
+            postGlobalKey(code: 0x04, flags: .maskCommand)
+            if waitUntilHidden(pid: pid, timeout: 0.5) { return report.joined(separator: " / ") + " / 全局⌘H 成功" }
+            report.append("全局⌘H 无效")
+        }
+
+        if allowMinimizeFallback, !nativeOnly {
+            report.append("降级最小化：\(minimizeAll(pid: pid))")
+        }
+        return report.joined(separator: " / ")
     }
 
     /// 关闭启动台：不用 Esc 打头（实测会把聚焦搜索唤起来）。
@@ -857,10 +917,11 @@ final class ClickMonitor {
     }
 
     /// 自测用：把「按下→抬起」整条判定链跑一遍（不依赖真实鼠标事件）
-    func testPipeline(at p: CGPoint, front: pid_t) {
-        work.sync {
+    func testPipeline(at p: CGPoint, front: pid_t, completion: @escaping () -> Void) {
+        work.async {
             self.onDown(p, front)
             self.onUp(p)
+            DispatchQueue.main.async(execute: completion)
         }
     }
 
@@ -868,27 +929,34 @@ final class ClickMonitor {
     ///   ① 按窗口自己的黄色按钮（与手点等价，genie 动画）
     ///   ② 向该进程发 ⌘M（走 app 自己的「最小化」菜单命令，也有动画）
     ///   ③ 直接置 AXMinimized（无动画，最后兜底）
-    /// 有的 app（QQ / ChatGPT）对 ① 返回 success 但窗口不动，必须靠 ②③ 兜住。
+    /// 有的 app 对 ① 返回 success 但窗口不动，必须靠 ②③ 兜住。
     @discardableResult
     private func minimizeAll(pid: pid_t) -> String {
+        guard !Prefs.isProtected(pid: pid) else { return "保护名单，跳过" }
+        if Prefs.usesNativeHide(pid: pid) { return hideApp(pid: pid, allowMinimizeFallback: false) }
         let (total, before) = DockAX.windowStats(pid: pid)
         guard total > 0 else { return "无窗口" }
         var report: [String] = []
 
         // 温和模式：只用 ⌘M，不按 AX 按钮、不置 AXMinimized。
-        // 实测 Electron 系应用（QQ）被外部置 AXMinimized 后会把自己窗口重新设成浮动层级
-        // （表现为「被置顶，别的程序盖不住」）。⌘M 是 app 自己的菜单命令，不会误按到别的按钮。
+        // QQ 只走应用自己的最小化菜单/⌘M，保留动画，不碰 AX 按钮或最小化属性。
         let gentle = NSRunningApplication(processIdentifier: pid)?
             .bundleIdentifier.map { Prefs.gentleApps.contains($0) } ?? false
         if gentle {
-            for i in 1...3 {
-                sendCmdM(pid: pid)
-                usleep(140_000)
-                let (t, m) = DockAX.windowStats(pid: pid)
-                if m >= t { return "⌘M 温和模式 \(i) 次→\(m)/\(t)" }
+            var lastMinimized = before
+            for attempt in 1...max(3, total + 1) {
+                let pressedMenu = attempt % 2 == 1 && DockAX.pressCommandMenu(pid: pid, character: "m")
+                if !pressedMenu { sendCmdM(pid: pid) }
+                let deadline = Date().addingTimeInterval(0.8)
+                repeat {
+                    usleep(40_000)
+                    let (t, m) = DockAX.windowStats(pid: pid)
+                    if t > 0, m >= t { return "原生最小化 \(attempt) 次→\(m)/\(t)（保留系统动画）" }
+                    if m > lastMinimized { lastMinimized = m; break }
+                } while Date() < deadline
             }
             let (t, m) = DockAX.windowStats(pid: pid)
-            return "⌘M 温和模式 3 次仍→\(m)/\(t)"
+            return "原生最小化未完成→\(m)/\(t)"
         }
 
         // ① 按黄色按钮
@@ -951,6 +1019,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var permissionTimer: DispatchSourceTimer?
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        Prefs.migrateCompatibility()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let b = statusItem.button {
             b.image = NSImage(systemSymbolName: "dock.rectangle", accessibilityDescription: "DockClickMin")
@@ -1063,7 +1132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(raise)
 
 
-        let minimizeItem = NSMenuItem(title: "收起方式：最小化窗口（原生动画）", action: #selector(useMinimize), keyEquivalent: "")
+        let minimizeItem = NSMenuItem(title: "收起方式：最小化优先（不兼容时隐藏）", action: #selector(useMinimize), keyEquivalent: "")
         minimizeItem.target = self
         minimizeItem.state = Prefs.mode == .minimize ? .on : .off
         menu.addItem(minimizeItem)
@@ -1172,22 +1241,44 @@ func runDump() {
 // MARK: - 自测（--selftest，必须通过 LaunchServices 启动，否则拿不到 TCC 授权）
 
 func runSelfTest() {
+    if let index = CommandLine.arguments.firstIndex(of: "--test-app"),
+       CommandLine.arguments.indices.contains(index + 1),
+       let target = NSRunningApplication.runningApplications(
+        withBundleIdentifier: CommandLine.arguments[index + 1]).first {
+        target.unhide()
+        target.activate(options: [])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { runSelfTest(target: target) }
+    } else {
+        runSelfTest(target: nil)
+    }
+}
+
+func runSelfTest(target: NSRunningApplication?) {
     dlog("=== selftest 开始 ===")
     dlog("AX 授权=\(axTrusted())")
     let tiles = DockAX.tiles()
     dlog("识别图标 \(tiles.count) 个")
     for t in tiles { dlog("   \(t.name) pid=\(t.pid) \(t.rect)") }
 
-    guard let front = NSWorkspace.shared.frontmostApplication else {
+    guard let front = target ?? NSWorkspace.shared.frontmostApplication else {
         dlog("结论：拿不到前台 app"); exit(0)
     }
     dlog("前台 \(front.localizedName ?? "?") pid=\(front.processIdentifier)")
+    let effectiveMode = Prefs.effectiveMode(bundleID: front.bundleIdentifier)
+
+    guard !Prefs.isProtected(bundleID: front.bundleIdentifier) else {
+        dlog("结论：SKIP —— 保护名单，自测不操作该应用")
+        exit(0)
+    }
 
     guard let tile = tiles.first(where: { $0.pid == front.processIdentifier }) else {
         dlog("结论：前台 app 没有对应的 Dock 图标，无法自测"); exit(0)
     }
     let c = CGPoint(x: tile.rect.midX, y: tile.rect.midY)
-    dlog("模拟点击「\(tile.name)」图标中心 \(c)，模式=\(Prefs.mode.rawValue)")
+    let nativeRestore = effectiveMode == .minimize && Prefs.usesNativeMinimize(pid: front.processIdentifier)
+    let restoreWindows = effectiveMode == .minimize && !nativeRestore
+        ? DockAX.windows(pid: front.processIdentifier).filter { !DockAX.isMinimized($0) } : []
+    dlog("模拟点击「\(tile.name)」图标中心 \(c)，实际模式=\(effectiveMode.rawValue)")
 
     // 采样窗口尺寸：如果最小化走的是动画，尺寸序列会出现中间帧
     var seq: [String] = []
@@ -1201,25 +1292,32 @@ func runSelfTest() {
     }
     sampler.resume()
 
-    ClickMonitor.shared.testPipeline(at: c, front: front.processIdentifier)
-
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+    ClickMonitor.shared.testPipeline(at: c, front: front.processIdentifier) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
         sampler.cancel()
         let app = NSRunningApplication(processIdentifier: front.processIdentifier)
         let hidden = app?.isHidden ?? false
         let stats = DockAX.windowStats(pid: front.processIdentifier)
         dlog("窗口尺寸序列（\(seq.count) 段）：\(seq.prefix(12).joined(separator: " → "))")
         dlog("结果：isHidden=\(hidden) 窗口 \(stats.minimized)/\(stats.total) 已最小化")
-        let ok = Prefs.mode == .hide ? hidden : (stats.total > 0 && stats.minimized == stats.total)
+        let ok = hidden || (stats.total > 0 && stats.minimized == stats.total)
         dlog(ok ? "结论：PASS —— 点图标成功收起了「\(tile.name)」"
                 : "结论：FAIL —— 没有收起")
-        if hidden { app?.unhide(); app?.activate(options: []) }
-        if Prefs.mode == .minimize {
-            DockAX.restoreAll(pid: front.processIdentifier)
-            dlog("已还原窗口（自测不改变你的桌面状态）")
+        if hidden { app?.unhide() }
+        for window in restoreWindows {
+            AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
         }
-        dlog("=== selftest 结束 ===")
-        exit(0)
+        if nativeRestore, stats.minimized > 0 { _ = DockAX.pressDockIcon(pid: front.processIdentifier) }
+        app?.activate(options: [])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            let restored = app?.isHidden == false && restoreWindows.allSatisfy { !DockAX.isMinimized($0) }
+                && (!nativeRestore || DockAX.windowStats(pid: front.processIdentifier).minimized == 0)
+            dlog(restored ? "恢复验证：PASS" : "恢复验证：FAIL")
+            dlog("=== selftest 结束 ===")
+            kLogQueue.sync {}
+            exit(ok && restored ? 0 : 2)
+        }
+        }
     }
 }
 

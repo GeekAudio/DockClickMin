@@ -26,12 +26,12 @@ fi
 
 echo "==> 编译 x86_64"
 swiftc -O -swift-version 5 -target "x86_64-apple-macos${SDK_TARGET_MIN}" \
-    -o "$STAGE/x86_64" main.swift \
+    -o "$STAGE/x86_64" main.swift WindowPolicy.swift \
     -framework Cocoa -framework ApplicationServices
 
 echo "==> 编译 arm64"
 swiftc -O -swift-version 5 -target "arm64-apple-macos${SDK_TARGET_MIN}" \
-    -o "$STAGE/arm64" main.swift \
+    -o "$STAGE/arm64" main.swift WindowPolicy.swift \
     -framework Cocoa -framework ApplicationServices
 
 echo "==> 合成通用二进制"

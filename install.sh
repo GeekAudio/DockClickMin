@@ -17,7 +17,7 @@ if [ -d "$DEST" ]; then
         exit 0
     fi
     echo "==> 退出正在运行的实例"
-    pkill -f "DockClickMin.app/Contents/MacOS/DockClickMin" 2>/dev/null || true
+    pkill -x DockClickMin 2>/dev/null || true
     sleep 1
     rm -rf "$DEST"
 fi

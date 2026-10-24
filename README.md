@@ -5,7 +5,19 @@
 > 点 Dock 图标 = 收起前台应用（Windows 任务栏语义），macOS 原生实现。
 > Click a Dock icon to collapse the frontmost app — pure Cocoa / Accessibility / CGEventTap, no third-party dependency.
 
-菜单栏常驻，无 Dock 图标。点一下收起（genie 动画飞进图标），再点一下还原。
+菜单栏常驻，无 Dock 图标。点一下收起，再点一下还原；QQ 使用应用自身的最小化命令，保留系统最小化动画。
+
+## 1.0.8
+
+换了个低饱和的扁平图标，还是熟悉的箭头。QQ 保留原生最小化动画，恢复时不再额外提到最前；访达也恢复点击收起支持。
+
+## 最小化兼容修复
+
+统一收起/恢复逻辑，默认不再排除 QQ 或访达。在最小化模式下，QQ 只调用应用自身的「最小化」菜单或定向发送 ⌘M，等待实际最小化结果并按需重试，保留系统动画；恢复全部交给原生 Dock。QQ 不按 `AXMinimizeButton`、不写 `AXMinimized`，也不额外执行 `AXRaise`。
+
+其他应用优先使用所选的全局收起方式，最小化失败时回退到隐藏。`hide()` 返回 `false` 也可能已经触发隐藏，因此会等待并验证结果，再决定是否回退；发送全局 ⌘H 前还会确认目标仍在前台，避免误隐藏已切换到的应用。
+
+保护名单 `protectedApps` 和原生隐藏名单 `nativeHideApps` 默认均为空；原生最小化名单 `nativeMinimizeApps` 始终包含 QQ，可添加其他应用。升级后首次启动执行兼容策略 v3 迁移：移除保护名单中原来的默认项访达和 QQ，移除 QQ 旧的原生隐藏策略，保留其他自定义项。同时清理跨点击残留的待提到前台状态，避免后续点击触发上一次点击留下的动作。不同应用对系统接口的支持仍有差异，实际效果以日志和实际操作验证为准。
 
 ---
 
@@ -27,7 +39,7 @@ CGEventTap(左键 down/up) ─┴─► 按下：记住当时的前台 pid
 
 三个关键设计：
 
-1. **listen-only 事件监听**：`CGEvent.tapCreate(options: .listenOnly)`，只读不拦截，物理上无法改写或吞掉你的输入。原生行为（含 ⌥-click 隐藏其他）全部保留。
+1. **保留普通点击的原生事件**：`CGEvent.tapCreate(options: .defaultTap)`，普通应用点击原样放行；仅在点击已打开的启动台图标、需要关闭启动台时吞掉这一组点击。带修饰键的点击（含 ⌥-click 隐藏其他）全部放行。
 2. **命中判定用 Dock 的 AX 树**，不是硬编码坐标。放大动画、图标增减、换位置都自动跟随。
 3. **1 秒刷新的矩形缓存**做廉价过滤，命中后才做精确 AX 查询，避免每次点击都付 IPC 成本。
 
@@ -77,8 +89,8 @@ cd DockClickMin
 |---|---|
 | 启用 | 总开关，关掉后事件监听停止 |
 | 开机自启 | 登录时自动启动，**默认开**（详见下文） |
-| 唤出时提到最前 | 点 Dock 图标唤出应用后，用 `AXRaise` 把它的主窗口提到最前，**默认开** |
-| 收起方式：最小化窗口（原生动画） | 按窗口黄色按钮 / ⌘M，genie 动画（**默认**） |
+| 唤出时提到最前 | 点 Dock 图标唤出应用后，用 `AXRaise` 把它的主窗口提到最前，**默认开**；原生最小化名单、原生隐藏名单和保护名单中的应用除外 |
+| 收起方式：最小化优先（不兼容时隐藏） | 普通应用按黄色按钮 / ⌘M，支持时使用系统动画（**默认**）；QQ 只用应用自身的最小化菜单 / 定向 ⌘M |
 | 收起方式：隐藏整个应用（瞬时，无动画） | `NSRunningApplication.hide()`，像 ⌘H |
 | 状态：监听中 · N 个图标 | 实时确认 AX 枚举是否正常 |
 | 状态：已停用 | 手动关掉了「启用」，此时不提示权限问题 |
@@ -89,20 +101,16 @@ cd DockClickMin
 
 | 方式 | 实现 | 动画 |
 |---|---|---|
-| **最小化窗口**（默认） | 三级回退，每级都验证结果 | ✅ 前两级有 |
-| 隐藏整个应用 | 四级回退，全失败降级为最小化 | ❌ 瞬时 |
+| **最小化窗口**（默认） | 三级最小化回退，每级验证结果，失败后尝试隐藏 | ✅ 前两级有 |
+| 隐藏整个应用 | 尝试隐藏并验证实际结果 | ❌ 瞬时 |
+| 原生最小化名单（始终含 QQ） | 最小化模式下只调用应用自身的最小化菜单 / 定向 ⌘M | ✅ 保留系统动画 |
+| 原生隐藏名单（默认空） | 优先于全局方式，只使用原生隐藏途径 | ❌ 瞬时 |
 
-**为什么隐藏也要回退**：实测 `NSRunningApplication.hide()` 对 TCC Helper（helper）、WorkBuddy（Electron）、Clash Verge（Tauri）**都返回 `false`**。于是按 app 类型踩出两条经验：
+**为什么隐藏也要验证**：`NSRunningApplication.hide()` 的返回值不能代替最终状态。部分应用会返回 `false`，随后仍完成隐藏；因此需要等待并检查，确认未隐藏后才尝试下一步。全局 ⌘H 只在目标仍是前台应用时发送。
 
-| 现象 | 原因 | 对策 |
-|---|---|---|
-| 设置 `AXHidden` 后「闪一下」 | Electron 类被置位后会自己弹回来 | AXHidden 挪到最后 |
-| `postToPid` 发 ⌘H 无效 | Tauri 类不认直接投递的键事件 | 先发**全局** ⌘H（走正常键盘事件流） |
+QQ 的最小化路径为：应用自身的「最小化」菜单 / 定向 ⌘M → 等待并检查实际最小化状态 → 必要时重试。此路径不按 `AXMinimizeButton`、不写 `AXMinimized`，恢复时也不额外执行 `AXRaise`。动画样式跟随系统设置，使用 genie 时保留飞入 Dock 的效果。原生命令最终未成功时只记录失败，不把 QQ 改成无动画隐藏。其他应用保留所选全局方式及相应回退，日志记录各步结果。
 
-最终顺序：`hide()` → 全局 ⌘H → ⌘H→pid → `AXHidden` → 降级最小化。日志逐级记录，例如
-`收起 Clash Verge：hide()=false / 全局⌘H 成功`。
-
-三级回退（`minimizeAll`）：
+普通应用的三级回退（`minimizeAll`，原生最小化名单除外）：
 
 | 级 | 动作 | 说明 |
 |---|---|---|
@@ -112,10 +120,10 @@ cd DockClickMin
 
 **窗口列表要过滤**：`kAXWindowsAttribute` 会混进非窗口元素 —— 访达会把桌面滚动区（`AXScrollArea`）也塞进窗口列表，它没有最小化按钮、永远收不起来。不过滤的话统计会卡在 `1/2`，还会反复重试。所以取窗口时按 `role == AXWindow` 过滤。
 
-**为什么需要三级**：AX 的 `.success` 只代表「消息投递成功」，不代表 app 照做。实测 **QQ 对 ① 返回 success 但窗口不动**。只写 ① 的话这类 app 点了没反应。日志会打印每级的实际效果：
+**为什么需要三级**：AX 的 `.success` 只代表「消息投递成功」，不代表 app 照做。某些应用可能返回成功但窗口不动，只写 ① 的话点了仍没反应。日志会打印每级的实际效果，例如：
 
 ```
-收起 QQ：按钮 1 成功→0/1 / ⌘M 1 次→1/1 / 起始 0/1
+收起 示例应用：按钮 1 成功→0/1 / ⌘M 1 次→1/1 / 起始 0/1
 ```
 
 最小化动画样式跟随系统设置 › 桌面与程序坞 ›「最小化窗口使用」：
@@ -127,13 +135,13 @@ defaults write com.apple.dock mineffect -string genie && killall Dock
 
 ## 点第二下会恢复
 
-窗口已全部最小化时，本工具**主动放行**（`stats.minimized == stats.total` 直接 return），于是系统原生的「点图标恢复所有窗口」照常工作。所以效果是：**点一下收起（带动画），再点一下还原（也带动画）** —— 正好是 Windows 任务栏的切换语义，还原那半是系统原生行为，零额外代码。
+窗口已全部最小化时，本工具**主动放行**（`stats.minimized == stats.total` 直接 return），于是系统原生的「点图标恢复所有窗口」照常工作。隐藏后的应用也由系统原生 Dock 唤回。恢复窗口本身由系统完成，不通过 AX 修改最小化状态。QQ 使用应用自身的最小化命令保留动画，点第二下同样交给 Dock 原生恢复，不再走实验性的 AX 恢复，也不会额外执行 `AXRaise`。
 
 ## 启动台（Apps / Launchpad）
 
 macOS 26 Tahoe 把启动台换成了 `/System/Applications/Apps.app`（`com.apple.apps.launcher`，`LSUIElement`）。它不是普通 app —— 没有「最小化」语义，点图标应当是**关闭**它。
 
-所以这一格走单独分支：识别到启动台图标时，按顺序发 **Esc** → `hide()` → `terminate()`，直到进程真的退出。日志会记 `关闭 启动台：terminated=true`。
+所以这一格走单独分支：启动台已打开时，吞掉这次图标点击，先用 Docklet 开关通知和切换前台应用关闭覆盖层，必要时再尝试 Esc。启动台关闭时点击图标，仍由原生 Dock 打开。
 
 注意：`open -b com.apple.apps.launcher` **打不开它**（只能由 Dock 图标唤起），所以这一条只能靠真实点击验证。
 
@@ -143,58 +151,77 @@ macOS 26 Tahoe 把启动台换成了 `/System/Applications/Apps.app`（`com.appl
 |---|---|---|
 | 点**非**前台的 Dock 图标 | 正常切换，不收起 | 按下时的前台 pid ≠ 图标 pid |
 | 窗口已全部最小化时点图标 | **原生恢复所有窗口** | 主动放行，不抢系统行为 |
-| 点**启动台**图标且它正开着 | 关闭它（Esc → hide → terminate） | 启动器没有最小化语义 |
-| 点**访达**图标 | 完全放行，不收起 | 访达是系统外壳，收起后桌面和文件窗口全没了 |
+| 点**启动台**图标且它正开着 | 吞掉这次点击并关闭覆盖层 | 启动器没有最小化语义 |
+| 点前台**访达**图标 | 按所选全局方式收起，最小化失败时尝试隐藏 | 默认不再排除访达 |
+| 点前台 **QQ** 图标 | 最小化模式下用应用自身的最小化菜单 / 定向 ⌘M，保留动画；再次点击由 Dock 原生恢复 | 始终在原生最小化名单中，不按 AX 最小化按钮、不写 `AXMinimized`、不额外执行 `AXRaise` |
 | 按住 ⌘/⌥/⌃/⇧ 点 | 完全放行 | 保留 ⌥-click 隐藏其他等原生操作 |
 | 图标内按下后拖拽（≥8pt） | 不触发 | 防止拖拽排序图标时误收起 |
 | app 一个窗口都没有 | 放行，走原生「打开新窗口」 | 否则会把「重新打开窗口」吃掉 |
-| 有对话框/无标题窗口 | 那类窗口没有黄色按钮，退回置 `AXMinimized`（无动画） | AX 限制 |
+| 有对话框/无标题窗口 | 普通应用可能退回置 `AXMinimized`（无动画）；QQ 等原生最小化名单中的应用只尝试自身菜单 / ⌘M | 应用提供的最小化接口不同 |
 | Dock 自动隐藏 | 鼠标探出后约 1 秒内可能不响应 | 矩形缓存 1s 刷新，Dock 未升起时图标坐标在屏幕外 |
 | 多显示器 | 支持 | 全程用全局屏幕坐标，不做屏幕假设 |
-| 唤出时提到最前 | 对普通应用有效，**压不过别的应用设置的浮动层级窗口** | `AXRaise` 只能越过同层级窗口；QQ 的置顶面板在 layer 3 |
+| 唤出时提到最前 | 对普通应用有效，**压不过其他浮动层级窗口** | `AXRaise` 只能越过同层级窗口；原生最小化名单、原生隐藏名单和保护名单中的应用不会执行此动作 |
 
-> 关于「QQ 一直置顶，别的程序盖不住」：这是 QQ 自己把窗口设成了浮动层级（CGWindow `layer=3`，正常窗口是 0），本工具从不修改窗口层级。在 QQ 里取消置顶即可（主面板标题栏的图钉 / 菜单里的「置顶」）。
+> 关于「QQ 一直置顶，别的程序盖不住」：旧版本存在直接修改 QQ 最小化状态的路径。1.0.7 改用 QQ 自身的最小化菜单 / 定向 ⌘M，并将恢复交给 Dock，保留最小化动画，同时移除对 QQ 的 AX 最小化按钮、最小化属性和额外提到最前操作。现有验证不足以保证这一调整能消除所有置顶原因，原生命令也可能暂时不响应；日志会记录实际结果。若 QQ 当前仍保持置顶，可在方便时退出 QQ 后重新打开。
 
 ## 保护名单
 
-默认包含**访达**和 **QQ**：点它们的图标完全放行，不会收起。
+`protectedApps` 默认为空，所有应用都参与统一收起/恢复逻辑。可以自行添加应用，将它们的 Dock 点击完全交给系统：不收起、不执行 AX 恢复或 `AXRaise`。升级后首次启动迁移旧配置，会移除过去默认加入的访达和 QQ，保留其他自定义项；迁移后仍可按自己的需要将它们加入排除名单。
 
-- 访达是系统外壳，收起后桌面和文件窗口全没了
-- **QQ 只要被最小化再恢复，就会把自己窗口设成浮动层级**（表现为「一直被置顶，别的程序盖不住」）。
-  实测用黄色按钮手动最小化再恢复也照样置顶，是 QQ 自身行为，与工具无关 —— 所以默认不碰它，
-  避免替用户触发这个副作用
-
-想改成只保护其中一个，或加别的应用，不必重新编译：
+想添加其他受保护应用，不必重新编译：
 
 ```bash
-# 只保护 QQ（访达恢复可收起）
-defaults write com.geekaudio.DockClickMin protectedApps -array com.tencent.qq
+# 添加需要完全排除的应用 bundle id
+defaults write com.geekaudio.DockClickMin protectedApps -array com.example.app
 
-# 只保护访达（恢复「点图标收起 QQ」）
-defaults write com.geekaudio.DockClickMin protectedApps -array com.apple.finder
-
-# 查看当前名单
+# 查看自定义名单
 defaults read com.geekaudio.DockClickMin protectedApps
+
+# 清空排除名单
+defaults write com.geekaudio.DockClickMin protectedApps -array
 ```
 
-> `-array` 是**整体覆盖**，必须把要保留的一起写进去。
-> 若已经置顶了：退出 QQ 再打开即可解除（实测重启后层级回到 0）。
+> `-array` 是**整体覆盖保存的自定义名单**，必须把要保留的其他应用一起写进去。
+
+## 原生最小化名单
+
+`nativeMinimizeApps` 始终包含 **QQ**（`com.tencent.qq`）。最小化模式下，名单中的应用只通过自身的「最小化」菜单 / 定向 ⌘M 收起，等待结果并按需重试，保留系统动画；不按 `AXMinimizeButton`、不写 `AXMinimized`，也不额外执行 `AXRaise`。再次点击图标由原生 Dock 恢复。
+
+可以把有类似窗口兼容性问题的应用加入名单。添加其他应用或覆盖自定义设置时，实际生效的名单仍包含 QQ。保护名单优先；选择全局隐藏模式，或自行将应用加入原生隐藏名单时，会按隐藏方式收起。
+
+```bash
+defaults read com.geekaudio.DockClickMin nativeMinimizeApps
+# 添加其他应用；实际生效的名单始终包含 QQ
+defaults write com.geekaudio.DockClickMin nativeMinimizeApps -array com.example.app
+```
+
+## 原生隐藏名单
+
+`nativeHideApps` 默认为空，可自行添加希望通过隐藏收起的应用。名单中的应用忽略全局收起方式，通过 `NSRunningApplication.hide()`、应用自身的隐藏菜单 / 定向 ⌘H 收起，并验证隐藏结果；不会写 `AXMinimized`、`AXHidden` 或执行 `AXRaise`。再次点击图标由原生 Dock 唤回，没有最小化动画。
+
+兼容策略 v3 迁移会移除旧设置中的 QQ 隐藏项，恢复它的原生最小化路径，保留其他自定义隐藏项。保护名单优先：若同一应用同时出现在保护名单中，将完全放行。
+
+```bash
+defaults read com.geekaudio.DockClickMin nativeHideApps
+# 添加希望固定通过隐藏收起的应用
+defaults write com.geekaudio.DockClickMin nativeHideApps -array com.example.app
+```
 
 ## 温和名单
 
-名单里的应用**只用 ⌘M 收起**，不按 AX 黄色按钮、也不直接置 `AXMinimized`。默认包含 QQ（`com.tencent.qq`）。
+`gentleApps` 为兼容保留的自定义名单，默认设置为空，实际生效时合并原生最小化名单（因此始终包含 QQ）。名单里的应用通过自身最小化菜单 / 定向 ⌘M 收起，不按 AX 黄色按钮、也不直接置 `AXMinimized`。
 
-原因：实测 Electron 系应用被外部置 `AXMinimized` 后，会把自己窗口重新设成浮动层级——表现为「一直被置顶，别的程序盖不住」。⌘M 是 app 自己的菜单命令，不存在误按到别的按钮的可能。
+这适合希望通过应用自身「最小化」菜单命令收起的场景。保护名单、原生隐藏名单优先。新设置建议使用上面的 `nativeMinimizeApps`。
 
 ```bash
 defaults read  com.geekaudio.DockClickMin gentleApps
-defaults write com.geekaudio.DockClickMin gentleApps -array com.tencent.qq   # 整体覆盖
+defaults write com.geekaudio.DockClickMin gentleApps -array com.example.app   # 整体覆盖
 ```
 
-某个应用还是被置顶，或者只想让它彻底不被收起：
+若想让某个应用彻底交给原生 Dock，可将其加入保护名单：
 
 ```bash
-defaults write com.geekaudio.DockClickMin protectedApps -array com.apple.finder com.tencent.qq
+defaults write com.geekaudio.DockClickMin protectedApps -array com.example.app
 ```
 
 ## 重编译会掉授权
