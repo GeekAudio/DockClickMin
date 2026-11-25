@@ -4,7 +4,7 @@
 //
 //  原理（纯系统 API，无第三方依赖）：
 //   1. AXUIElement 读 Dock 进程的辅助功能树 → 每个应用图标的实时矩形 + bundle id
-//   2. CGEventTap 看左键按下/抬起；普通应用原样放行，仅关闭启动台时拦截点击
+//   2. CGEventTap 看左键按下/抬起；拦截过渡期间同一图标的连点和关闭启动台的点击
 //   3. 按下时记住「当时的前台 app」；抬起时若落点仍在同一个图标内、且该 app 就是
 //      按下时的前台 app ⇒ 这是「再次点击已在前台的图标」⇒ 收起它
 //
@@ -530,27 +530,6 @@ func launcherHostPID() -> pid_t? {
     return nil
 }
 
-/// 屏幕窗口栈里最上层的「普通窗口」（layer 0）属于谁。
-/// 用途：窗口已经在最上面、但系统不认为它是活跃应用时，点它的图标应当直接收起，而不是先"切换"。
-func topmostNormalWindowPID() -> pid_t? {
-    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-    guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return nil }
-    let me = getpid()
-    let dockPID = DockAX.dockPID()
-    for w in list {
-        guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
-        guard let pid = w[kCGWindowOwnerPID as String] as? pid_t else { continue }
-        if pid == me || pid == dockPID { continue }
-        let alpha = w[kCGWindowAlpha as String] as? Double ?? 1
-        if alpha <= 0.01 { continue }
-        guard let b = w[kCGWindowBounds as String] as? NSDictionary,
-              let rect = CGRect(dictionaryRepresentation: b as CFDictionary),
-              rect.width > 40, rect.height > 40 else { continue }
-        return pid
-    }
-    return nil
-}
-
 func hasVisibleAppWindow(pid: pid_t) -> Bool {
     let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
         as? [[String: Any]] ?? []
@@ -568,14 +547,35 @@ func hasVisibleAppWindow(pid: pid_t) -> Bool {
 final class ClickMonitor {
     static let shared = ClickMonitor()
 
+    private struct Transition {
+        let id: Int
+        var tile: DockTile
+        var intent = WindowClickIntent()
+        var mouseIsDown = false
+        var windowsToRestore: [AXUIElement] = []
+    }
+
+    private struct TransitionCheck {
+        var finishAfter: TimeInterval
+        var deadline: TimeInterval
+        var retryAfter: TimeInterval = 0
+        var revision = 0
+        var attempts = 0
+    }
+
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
-    private var pending: (tile: DockTile, down: CGPoint)?
+    private var pending: (tile: DockTile, down: CGPoint, target: WindowVisibility?, inputID: Int?)?
     private var raisePending: pid_t?
     private var clickSequence = 0
     /// 刚刚对它做过收起动作（最小化/隐藏）的时间戳：此期间不允许「提到最前」再把它拉回来
     private var suppressRaiseUntil: Date = .distantPast
     private let work = DispatchQueue(label: "com.geekaudio.dockclickmin.work")
+    // 事件入口记录连点，最小化重试可直接读取最新目标。
+    private let transitionLock = NSLock()
+    private var transition: Transition?
+    private var inputID = 0
+    private var dockDown: (id: Int, tile: DockTile, point: CGPoint, intercepted: Bool)?
     private(set) var lastError: String?
 
     var isRunning: Bool { tap != nil }
@@ -616,6 +616,11 @@ final class ClickMonitor {
         tap = nil
         source = nil
         swallowUp = false
+        dockDown = nil
+        transitionLock.withLock {
+            inputID += 1
+            transition = nil
+        }
         work.async { self.clearClick() }
         TileCache.shared.stop()
         dlog("事件监听已停止")
@@ -626,6 +631,11 @@ final class ClickMonitor {
     /// 返回 nil = 吞掉这次事件；返回 event = 原样放行
     fileprivate func handle(type: CGEventType, event: CGEvent) -> CGEvent? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            dockDown = nil
+            transitionLock.withLock {
+                inputID += 1
+                transition = nil
+            }
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
             dlog("tap 被系统临时禁用，已重新启用")
             return event
@@ -634,17 +644,59 @@ final class ClickMonitor {
 
         // 带修饰键时完全放行：保留 ⌥-click「隐藏其他」、⌘-click 等原生行为
         let mods: CGEventFlags = [.maskCommand, .maskAlternate, .maskControl, .maskShift]
-        if !event.flags.intersection(mods).isEmpty {
+        let hasModifier = !event.flags.intersection(mods).isEmpty
+        let loc = event.location
+        if type == .leftMouseUp, let down = dockDown {
+            dockDown = nil
+            let clicked = !hasModifier && matchesClick(up: loc, down: down.point, tile: down.tile)
+            transitionLock.withLock {
+                if down.intercepted {
+                    guard transition?.id == down.id else { return }
+                    transition?.mouseIsDown = false
+                    if clicked { transition?.intent.reverse() }
+                } else if clicked, down.id == inputID {
+                    // AX 判定尚在后台执行时，同一图标的下一击也能先记下。
+                    transition = Transition(id: down.id, tile: down.tile)
+                }
+            }
+            if down.intercepted { return nil }
+        }
+        if hasModifier {
+            transitionLock.withLock {
+                inputID += 1
+                transition = nil
+            }
             work.async { self.clearClick() }
             return event
         }
 
-        let loc = event.location
         switch type {
         case .leftMouseDown:
+            let target = TileCache.shared.tiles.first(where: { $0.rect.contains(loc) })
+            dockDown = nil
+            let id = transitionLock.withLock {
+                if let current = transition,
+                   let tile = target, tile.pid == current.tile.pid,
+                   !Prefs.isProtected(bundleID: tile.bundleID) {
+                    transition?.mouseIsDown = true
+                    dockDown = (current.id, tile, loc, true)
+                    return current.id
+                }
+                inputID += 1
+                transition = nil
+                if let tile = target, tile.pid > 0, !isLauncher(tile),
+                   !Prefs.isProtected(bundleID: tile.bundleID) {
+                    dockDown = (inputID, tile, loc, false)
+                }
+                return inputID
+            }
+            if dockDown?.intercepted == true {
+                work.async { self.clearClick() }
+                return nil
+            }
             // 启动台快速路径：只用缓存矩形判断（几微秒），命中就吞掉这次点击，
-            // 让程序坞完全不处理它，同时立刻发 Esc —— 这样没有「关掉又被点开」的竞争。
-            if let t = TileCache.shared.tiles.first(where: { $0.rect.contains(loc) }),
+            // 让程序坞完全不处理它，避免「关掉又被点开」的竞争。
+            if let t = target,
                isLauncher(t), launcherOverlayOpen() {
                 work.async { self.clearClick() }
                 swallowUp = true
@@ -652,15 +704,22 @@ final class ClickMonitor {
                 return nil
             }
             let front = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
-            let target = TileCache.shared.tiles.first(where: { $0.rect.contains(loc) })
             let wasHidden = target.flatMap { NSRunningApplication(processIdentifier: $0.pid) }?.isHidden ?? false
-            work.async { self.onDown(loc, front, wasHidden: wasHidden) }
+            // 最小化后 app 可能还是前台。Dock 能在后台 AX 查询前先恢复它，
+            // 因此点击时也用非 AX 的窗口列表留一份可见状态。
+            let wasVisible = target?.pid == front && front > 0 && !wasHidden
+                ? hasVisibleAppWindow(pid: front) : nil
+            work.async {
+                self.onDown(loc, front, targetPID: target?.pid, wasHidden: wasHidden,
+                            wasVisible: wasVisible, inputID: id)
+            }
         case .leftMouseUp:
             if swallowUp {
                 swallowUp = false
                 return nil
             }
-            work.async { self.onUp(loc) }
+            let id = transitionLock.withLock { inputID }
+            work.async { self.onUp(loc, inputID: id) }
         default:
             break
         }
@@ -704,21 +763,19 @@ final class ClickMonitor {
         clickSequence += 1
     }
 
-    private func onDown(_ p: CGPoint, _ front: pid_t, wasHidden: Bool = false) {
+    private func onDown(_ p: CGPoint, _ front: pid_t, targetPID: pid_t? = nil,
+                        wasHidden: Bool = false, wasVisible: Bool? = nil, inputID: Int? = nil) {
         downSeen += 1
         clearClick()
         let band = TileCache.shared.band
-        let inBand = !band.isNull && band.contains(p)
+        guard !band.isNull, band.contains(p) else { return }
         let tiles = DockAX.tiles()
         let hit = tiles.first(where: { $0.rect.contains(p) })
 
         // 埋点：只记落在 Dock 区域/图标上的点击，平时很安静，排错时能定位到具体哪一步断了
-        if inBand || hit != nil {
-            let h = hit.map { "\($0.name)|\($0.bundleID ?? "-")|pid=\($0.pid)" } ?? "nil"
-            dlog("DOWN#\(downSeen) \(Int(p.x)),\(Int(p.y)) inBand=\(inBand) tiles=\(tiles.count) hit=\(h) front=\(front) top=\(topmostNormalWindowPID().map(String.init) ?? "-") overlay=\(launcherOverlayOpen())")
-        }
-
-        guard inBand, let tile = hit else { return }
+        let h = hit.map { "\($0.name)|\($0.bundleID ?? "-")|pid=\($0.pid)" } ?? "nil"
+        dlog("DOWN#\(downSeen) \(Int(p.x)),\(Int(p.y)) tiles=\(tiles.count) hit=\(h) front=\(front)")
+        guard let tile = hit else { return }
 
         // 启动台：点图标 = 关闭它（启动器没有「最小化」语义，也不该看窗口数）
         if isLauncher(tile) {
@@ -726,7 +783,7 @@ final class ClickMonitor {
             guard launcherOverlayOpen() else { return }   // 关着 ⇒ 让原生去打开
             // 注意：不在这里发 Esc。按下就发会被这次点击的处理压住，反而更慢，
             // 而且可能「先关后开」。统一放到 mouseUp 之后发。
-            pending = (DockTile(pid: -1, name: tile.name, bundleID: tile.bundleID, rect: tile.rect), p)
+            pending = (tile, p, .collapsed, inputID)
             dlog("启动台开着 → 抬起后关闭")
             return
         }
@@ -738,20 +795,20 @@ final class ClickMonitor {
         }
 
         // 必须使用按下瞬间的前台状态；异步看窗口栈会把刚恢复的窗口再次收起。
-        if tile.pid != front || wasHidden {
-            if Prefs.raiseOnSummon, !Prefs.usesNativeWindowActions(pid: tile.pid) { raisePending = tile.pid }
-            return
-        }
-
-        // 无窗口 / 窗口已全部最小化 ⇒ 系统会自己「打开新窗口 / 恢复所有窗口」，之后也提一下
+        guard tile.pid > 0 else { return }
+        let wasHidden = tile.pid == targetPID && wasHidden
+        let wasVisible = tile.pid == targetPID ? wasVisible : nil
         let stats = DockAX.windowStats(pid: tile.pid)
-        guard WindowPolicy.shouldCollapse(isFrontAtMouseDown: tile.pid == front, wasHidden: wasHidden,
-                                          windowCount: stats.total, minimizedCount: stats.minimized,
-                                          hasVisibleWindow: hasVisibleAppWindow(pid: tile.pid)) else {
+        let hasVisibleWindow = stats.total == 0 && hasVisibleAppWindow(pid: tile.pid)
+        if WindowPolicy.shouldCollapse(isFrontAtMouseDown: tile.pid == front, wasHidden: wasHidden,
+                                       windowCount: stats.total, minimizedCount: stats.minimized,
+                                       hasVisibleWindow: hasVisibleWindow, wasVisibleAtMouseDown: wasVisible) {
+            pending = (tile, p, .collapsed, inputID)
+        } else {
+            let target: WindowVisibility? = wasHidden || stats.total > 0 || hasVisibleWindow ? .visible : nil
+            pending = (tile, p, target, inputID)
             if Prefs.raiseOnSummon, !Prefs.usesNativeWindowActions(pid: tile.pid) { raisePending = tile.pid }
-            return
         }
-        pending = (tile, p)
     }
 
     private func isLauncher(_ t: DockTile) -> Bool {
@@ -759,7 +816,16 @@ final class ClickMonitor {
         return kLauncherNames.contains(t.name)
     }
 
-    private func onUp(_ p: CGPoint) {
+    private func onUp(_ p: CGPoint, inputID: Int? = nil) {
+        guard let click = pending, matchesClick(up: p, down: click.down, tile: click.tile) else {
+            pending = nil
+            raisePending = nil
+            transitionLock.withLock {
+                if transition?.id == inputID, transition?.intent.target == nil { transition = nil }
+            }
+            return
+        }
+        pending = nil
         if let pid = raisePending {
             raisePending = nil
             let sequence = clickSequence
@@ -769,10 +835,137 @@ final class ClickMonitor {
                 self.raiseApp(pid: pid)
             }
         }
-        guard let (tile, down) = pending else { return }
-        pending = nil
-        guard hypot(p.x - down.x, p.y - down.y) < 8, tile.rect.contains(p) else { return }
-        act(tile)
+        if isLauncher(click.tile) {
+            closeLauncher()
+        } else if let inputID = click.inputID, let target = click.target {
+            startTransition(tile: click.tile, target: target, inputID: inputID)
+        } else if click.target == .collapsed {
+            collapse(click.tile)
+        } else {
+            transitionLock.withLock {
+                if transition?.id == inputID { transition = nil }
+            }
+        }
+    }
+
+    private func matchesClick(up: CGPoint, down: CGPoint, tile: DockTile) -> Bool {
+        hypot(up.x - down.x, up.y - down.y) < 8 && tile.rect.contains(up)
+    }
+
+    private func startTransition(tile: DockTile, target: WindowVisibility, inputID: Int) {
+        let started = transitionLock.withLock {
+            guard self.inputID == inputID else { return false }
+            if transition?.tile.pid != tile.pid { transition = Transition(id: inputID, tile: tile) }
+            transition?.tile = tile
+            transition?.intent.begin(target: target)
+            return true
+        }
+        guard started else { return }
+        let began = ProcessInfo.processInfo.systemUptime
+        if target == .collapsed {
+            collapseDuringTransition(tile, id: inputID)
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        checkTransition(id: inputID, progress: TransitionCheck(finishAfter: max(began + 0.52, now + 0.12),
+                                                               deadline: max(began + 1.05, now + 0.35)))
+    }
+
+    private func transitionWants(_ target: WindowVisibility, id: Int) -> Bool {
+        guard Prefs.enabled else { return false }
+        return transitionLock.withLock { transition?.id == id && transition?.intent.target == target }
+    }
+
+    private func collapseDuringTransition(_ tile: DockTile, id: Int) {
+        guard transitionWants(.collapsed, id: id) else { return }
+        let visibleWindows = DockAX.windows(pid: tile.pid).filter { !DockAX.isMinimized($0) }
+        transitionLock.withLock {
+            if transition?.id == id { transition?.windowsToRestore = visibleWindows }
+        }
+        collapse(tile) { self.transitionWants(.collapsed, id: id) }
+    }
+
+    private func checkTransition(id: Int, progress: TransitionCheck) {
+        guard let current = transitionLock.withLock({ transition }), current.id == id,
+              let requested = current.intent.target else { return }
+        let tile = current.tile
+        guard let app = NSRunningApplication(processIdentifier: tile.pid), !app.isTerminated,
+              Prefs.enabled, !Prefs.isProtected(bundleID: app.bundleIdentifier) else {
+            transitionLock.withLock { if transition?.id == id { transition = nil } }
+            return
+        }
+
+        var next = progress
+        let now = ProcessInfo.processInfo.systemUptime
+        if current.intent.revision != next.revision {
+            next.revision = current.intent.revision
+            next.attempts = 0
+            next.deadline = now + 1.2
+            next.finishAfter = max(next.finishAfter, now + 0.15)
+            dlog("连点 \(tile.name) ×\(next.revision + 1)：\(requested == .visible ? "恢复" : "收起")")
+        }
+        if now < next.finishAfter, next.revision == 0 || current.mouseIsDown {
+            scheduleTransitionCheck(id: id, progress: next)
+            return
+        }
+        let observed: WindowVisibility?
+        if app.isHidden {
+            observed = .collapsed
+        } else {
+            let stats = DockAX.windowStats(pid: tile.pid)
+            if stats.total > 0 {
+                observed = stats.minimized == stats.total ? .collapsed : .visible
+            } else {
+                observed = hasVisibleAppWindow(pid: tile.pid) ? .visible : nil
+            }
+        }
+        let front = NSWorkspace.shared.frontmostApplication?.processIdentifier == tile.pid
+        let minimizedDuringCollapse = requested == .visible
+            ? current.windowsToRestore.filter { DockAX.isMinimized($0) } : []
+        let atTarget = observed == requested && minimizedDuringCollapse.isEmpty
+        if now >= next.finishAfter && (atTarget || now >= next.deadline) {
+            let finished = transitionLock.withLock {
+                guard let live = transition, live.id == id,
+                      live.intent.revision == next.revision, !live.mouseIsDown else { return false }
+                transition = nil
+                return true
+            }
+            if finished {
+                if !atTarget, next.revision > 0 { dlog("连点 \(tile.name)：窗口状态确认超时") }
+                return
+            }
+        }
+        if now < next.deadline, now >= next.retryAfter, !current.mouseIsDown,
+           let target = current.intent.followUp(observed: observed, isFrontmost: front,
+                                               hasWindowsToRestore: !minimizedDuringCollapse.isEmpty),
+           next.attempts < (target == .visible ? 3 : 1), transitionWants(target, id: id) {
+            next.attempts += 1
+            if target == .visible {
+                if observed == .visible, front, !Prefs.usesNativeWindowActions(pid: tile.pid) {
+                    // Dock 只激活仍有可见窗口的应用；这里仅恢复这次被收起的窗口。
+                    for window in minimizedDuringCollapse {
+                        guard transitionWants(.visible, id: id) else { break }
+                        AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+                    }
+                    dlog("连点恢复 \(tile.name)：恢复本次收起的窗口")
+                } else {
+                    let pressed = DockAX.pressDockIcon(pid: tile.pid)
+                    dlog("连点恢复 \(tile.name)：Dock 按压=\(pressed)，第 \(next.attempts) 次")
+                }
+            } else {
+                collapseDuringTransition(tile, id: id)
+            }
+            let finishedAt = ProcessInfo.processInfo.systemUptime
+            next.retryAfter = finishedAt + 0.30
+            next.finishAfter = max(next.finishAfter, finishedAt + 0.42)
+            next.deadline = max(next.deadline, next.finishAfter)
+        }
+        scheduleTransitionCheck(id: id, progress: next)
+    }
+
+    private func scheduleTransitionCheck(id: Int, progress: TransitionCheck) {
+        work.asyncAfter(deadline: .now() + .milliseconds(55)) { [weak self] in
+            self?.checkTransition(id: id, progress: progress)
+        }
     }
 
     /// 把应用的主窗口提到最前（AXRaise）。
@@ -794,12 +987,8 @@ final class ClickMonitor {
         AXUIElementPerformAction(w, kAXRaiseAction as CFString)
     }
 
-    private func act(_ tile: DockTile) {
-        if isLauncher(tile) {
-            closeLauncher()
-            return
-        }
-        guard Prefs.enabled, !Prefs.isProtected(bundleID: tile.bundleID),
+    private func collapse(_ tile: DockTile, shouldContinue: () -> Bool = { true }) {
+        guard shouldContinue(), Prefs.enabled, !Prefs.isProtected(bundleID: tile.bundleID),
               !Prefs.isProtected(pid: tile.pid) else { return }
         guard let app = NSRunningApplication(processIdentifier: tile.pid) else { return }
 
@@ -810,16 +999,17 @@ final class ClickMonitor {
 
         switch Prefs.effectiveMode(bundleID: app.bundleIdentifier) {
         case .hide:
-            dlog("收起 \(tile.name)：\(hideApp(pid: tile.pid))")
+            dlog("收起 \(tile.name)：\(hideApp(pid: tile.pid, shouldContinue: shouldContinue))")
         case .minimize:
-            let r = minimizeAll(pid: tile.pid)
+            let r = minimizeAll(pid: tile.pid, shouldContinue: shouldContinue)
+            guard shouldContinue() else { return }
             let stats = DockAX.windowStats(pid: tile.pid)
             if stats.total > 0, stats.minimized == stats.total {
                 dlog("收起 \(tile.name)：\(r)")
             } else if Prefs.usesNativeMinimize(pid: tile.pid) {
                 dlog("收起 \(tile.name)：\(r) / 保留原生最小化方式，未改用无动画隐藏")
             } else {
-                dlog("收起 \(tile.name)：\(r) / 最小化未完成，改用隐藏：\(hideApp(pid: tile.pid, allowMinimizeFallback: false))")
+                dlog("收起 \(tile.name)：\(r) / 最小化未完成，改用隐藏：\(hideApp(pid: tile.pid, allowMinimizeFallback: false, shouldContinue: shouldContinue))")
             }
         }
         TileCache.shared.refresh()
@@ -827,9 +1017,10 @@ final class ClickMonitor {
     }
 
     /// 等待真实隐藏状态；hide() 返回 false 也可能已经异步成功。
-    private func waitUntilHidden(pid: pid_t, timeout: TimeInterval) -> Bool {
+    private func waitUntilHidden(pid: pid_t, timeout: TimeInterval, shouldContinue: () -> Bool) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         repeat {
+            guard shouldContinue() else { return false }
             if NSRunningApplication(processIdentifier: pid)?.isHidden == true { return true }
             usleep(40_000)
         } while Date() < deadline
@@ -838,32 +1029,44 @@ final class ClickMonitor {
 
     /// 原生隐藏 → 原生菜单 → 定向 ⌘H，每一级等待实际效果后才回退。
     /// 原生命令兼容应用不使用 AXHidden/AXMinimized，也不发送全局快捷键。
-    private func hideApp(pid: pid_t, allowMinimizeFallback: Bool = true) -> String {
+    private func hideApp(pid: pid_t, allowMinimizeFallback: Bool = true,
+                         shouldContinue: () -> Bool) -> String {
+        guard shouldContinue() else { return "已取消旧收起动作" }
         guard !Prefs.isProtected(pid: pid) else { return "保护名单，跳过" }
         guard let app = NSRunningApplication(processIdentifier: pid) else { return "无进程" }
         if app.isHidden { return "已隐藏" }
         let nativeOnly = Prefs.usesNativeWindowActions(pid: pid)
         let request = app.hide()
-        if waitUntilHidden(pid: pid, timeout: 0.8) { return "原生隐藏已确认（hide()=\(request)）" }
+        if waitUntilHidden(pid: pid, timeout: 0.8, shouldContinue: shouldContinue) {
+            return "原生隐藏已确认（hide()=\(request)）"
+        }
         var report = ["hide()=\(request)，未确认隐藏"]
 
-        if DockAX.pressCommandMenu(pid: pid, character: "h"), waitUntilHidden(pid: pid, timeout: 0.5) {
+        guard shouldContinue() else { return "已取消旧收起动作" }
+        if DockAX.pressCommandMenu(pid: pid, character: "h"),
+           waitUntilHidden(pid: pid, timeout: 0.5, shouldContinue: shouldContinue) {
             return report.joined(separator: " / ") + " / 原生隐藏菜单成功"
         }
         report.append("隐藏菜单未生效")
 
+        guard shouldContinue() else { return "已取消旧收起动作" }
         sendKey(pid: pid, code: 0x04, flags: .maskCommand)
-        if waitUntilHidden(pid: pid, timeout: 0.5) { return report.joined(separator: " / ") + " / ⌘H→pid 成功" }
+        if waitUntilHidden(pid: pid, timeout: 0.5, shouldContinue: shouldContinue) {
+            return report.joined(separator: " / ") + " / ⌘H→pid 成功"
+        }
         report.append("⌘H→pid 无效")
 
+        guard shouldContinue() else { return "已取消旧收起动作" }
         if !nativeOnly, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
             postGlobalKey(code: 0x04, flags: .maskCommand)
-            if waitUntilHidden(pid: pid, timeout: 0.5) { return report.joined(separator: " / ") + " / 全局⌘H 成功" }
+            if waitUntilHidden(pid: pid, timeout: 0.5, shouldContinue: shouldContinue) {
+                return report.joined(separator: " / ") + " / 全局⌘H 成功"
+            }
             report.append("全局⌘H 无效")
         }
 
         if allowMinimizeFallback, !nativeOnly {
-            report.append("降级最小化：\(minimizeAll(pid: pid))")
+            report.append("降级最小化：\(minimizeAll(pid: pid, shouldContinue: shouldContinue))")
         }
         return report.joined(separator: " / ")
     }
@@ -931,9 +1134,12 @@ final class ClickMonitor {
     ///   ③ 直接置 AXMinimized（无动画，最后兜底）
     /// 有的 app 对 ① 返回 success 但窗口不动，必须靠 ②③ 兜住。
     @discardableResult
-    private func minimizeAll(pid: pid_t) -> String {
+    private func minimizeAll(pid: pid_t, shouldContinue: () -> Bool) -> String {
+        guard shouldContinue() else { return "已取消旧收起动作" }
         guard !Prefs.isProtected(pid: pid) else { return "保护名单，跳过" }
-        if Prefs.usesNativeHide(pid: pid) { return hideApp(pid: pid, allowMinimizeFallback: false) }
+        if Prefs.usesNativeHide(pid: pid) {
+            return hideApp(pid: pid, allowMinimizeFallback: false, shouldContinue: shouldContinue)
+        }
         let (total, before) = DockAX.windowStats(pid: pid)
         guard total > 0 else { return "无窗口" }
         var report: [String] = []
@@ -945,11 +1151,13 @@ final class ClickMonitor {
         if gentle {
             var lastMinimized = before
             for attempt in 1...max(3, total + 1) {
+                guard shouldContinue() else { return "已取消旧收起动作" }
                 let pressedMenu = attempt % 2 == 1 && DockAX.pressCommandMenu(pid: pid, character: "m")
-                if !pressedMenu { sendCmdM(pid: pid) }
+                if !pressedMenu, shouldContinue() { sendCmdM(pid: pid) }
                 let deadline = Date().addingTimeInterval(0.8)
                 repeat {
                     usleep(40_000)
+                    guard shouldContinue() else { return "已取消旧收起动作" }
                     let (t, m) = DockAX.windowStats(pid: pid)
                     if t > 0, m >= t { return "原生最小化 \(attempt) 次→\(m)/\(t)（保留系统动画）" }
                     if m > lastMinimized { lastMinimized = m; break }
@@ -962,6 +1170,7 @@ final class ClickMonitor {
         // ① 按黄色按钮
         var pressed = 0
         for w in DockAX.windows(pid: pid) {
+            guard shouldContinue() else { return "已取消旧收起动作" }
             guard !DockAX.isMinimized(w) else { continue }
             if let b = DockAX.minimizeButton(w), AXUIElementPerformAction(b, kAXPressAction as CFString) == .success {
                 pressed += 1
@@ -975,6 +1184,7 @@ final class ClickMonitor {
         // ② ⌘M 给还没动的窗口
         var sent = 0
         for _ in 0..<max(0, t - m) {
+            guard shouldContinue() else { return "已取消旧收起动作" }
             sendCmdM(pid: pid)
             sent += 1
             usleep(120_000)
@@ -986,6 +1196,7 @@ final class ClickMonitor {
         // ③ 直接置属性
         var forced = 0
         for w in DockAX.windows(pid: pid) where !DockAX.isMinimized(w) {
+            guard shouldContinue() else { return "已取消旧收起动作" }
             if AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, kCFBooleanTrue) == .success {
                 forced += 1
             }
